@@ -1,0 +1,49 @@
+browser:
+  profile_dir: data/chrome_profile
+  channel: chrome
+  headless: false
+  hide_window: true
+  viewport:
+    width: 1400
+    height: 900
+  locale: ko-KR
+  timezone: Asia/Seoul
+  default_timeout_ms: 15000
+  navigation_timeout_ms: 30000
+automation:
+  typing_delay_ms: 0
+  retry_attempts: 2
+  retry_backoff_base: 0.5
+  auto_click_final_payment: false
+  skip_on_error: true
+  skip_on_pause: true
+  inter_order_delay_ms: 300
+  screenshot_on_error: true
+  stealth_enabled: true
+  verify_shopback: true
+  abort_if_no_shopback: false
+price_scraper:
+  concurrent: 1
+  per_product_timeout_ms: 8000
+  inter_request_delay_ms: 800
+excel:
+  auto_save: true
+  backup_on_load: true
+  output_suffix: _완료
+logging:
+  level: INFO
+  rotation: 00:00
+  retention_days: 30
+  max_file_mb: 10
+ui:
+  theme: light
+  log_max_lines: 500
+  table_row_height: 32
+  first_run: false
+  show_empty_state_help: true
+  shopback_install_prompted: true
+  recent_excel_files:
+  - /Users/johyeon-ung/Downloads/0.11마존+주문전송_완료_20260426_071902.xlsx
+  - /Users/johyeon-ung/Downloads/0.11마존+주문전송.xlsx
+  - /Users/johyeon-ung/Downloads/0.11마존+주문전송_완료_20260425_001613.xlsx
+  recent_excel_max: 10

@@ -1,0 +1,65 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"          # v1.0.0 같은 태그 푸시 시 자동 빌드 + 릴리스
+  workflow_dispatch:  # 수동 실행 (Actions 탭에서 버튼 클릭)
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install pyinstaller
+
+      - name: Build .exe
+        run: |
+          pyinstaller build/build.spec --clean --noconfirm
+
+      - name: Verify build
+        run: |
+          if (!(Test-Path "dist/11st_auto_order.exe")) {
+            Write-Error "dist/11st_auto_order.exe 가 만들어지지 않았습니다."
+            exit 1
+          }
+          Get-Item dist/11st_auto_order.exe | Select-Object Name,Length
+
+      - name: Package as ZIP
+        run: |
+          $version = "1.0.0"
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $version = $env:GITHUB_REF -replace "refs/tags/v",""
+          }
+          Compress-Archive -Path dist/11st_auto_order.exe `
+            -DestinationPath "dist/11st_auto_order-$version-win.zip"
+          Get-Item "dist/11st_auto_order-$version-win.zip" | Select-Object Name,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 11st_auto_order-windows
+          path: dist/*.zip
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

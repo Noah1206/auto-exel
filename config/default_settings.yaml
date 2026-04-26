@@ -1,0 +1,44 @@
+# 기본 사용자 설정 (settings.yaml이 없으면 이 값 사용)
+browser:
+  profile_dir: "data/chrome_profile"
+  channel: "chrome"                # system Chrome 사용
+  headless: false                  # extensions require headed
+  viewport:
+    width: 1400
+    height: 900
+  locale: "ko-KR"
+  timezone: "Asia/Seoul"
+  default_timeout_ms: 15000
+  navigation_timeout_ms: 30000
+
+automation:
+  typing_delay_ms: 50              # 사람같은 타이핑
+  retry_attempts: 3
+  retry_backoff_base: 1.0          # 지수 백오프 기본값
+  auto_click_final_payment: false  # 최종 결제 자동 클릭 (기본 off - 안전)
+  inter_order_delay_ms: 1500       # 주문 간 딜레이
+  screenshot_on_error: true
+  stealth_enabled: true
+
+price_scraper:
+  concurrent: 1                    # 순차 실행 (bot 의심 회피)
+  per_product_timeout_ms: 8000
+  inter_request_delay_ms: 800
+
+excel:
+  auto_save: true
+  backup_on_load: true
+  output_suffix: "_완료"
+
+logging:
+  level: "INFO"
+  rotation: "00:00"                # 일별 로테이션
+  retention_days: 30
+  max_file_mb: 10
+
+ui:
+  theme: "light"
+  log_max_lines: 500
+  table_row_height: 32
+  first_run: true                # 첫 실행 시 온보딩 마법사 표시
+  show_empty_state_help: true    # 테이블 비어있을 때 도움말 배너 표시

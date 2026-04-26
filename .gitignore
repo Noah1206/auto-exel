@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Runtime data
+data/
+
+# Build artifacts
+build/build/
+build/dist/
+dist/
+*.spec.bak
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
