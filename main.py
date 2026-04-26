@@ -8,8 +8,13 @@
 """
 from __future__ import annotations
 
+import multiprocessing
 import sys
 from pathlib import Path
+
+# PyInstaller 동결 환경에서 multiprocessing 자식 프로세스가 main.py 를 다시
+# 실행하면서 무한 fork 가 발생하는 것을 막는다 (macOS .app 필수).
+multiprocessing.freeze_support()
 
 # src 패키지 import 가능하도록
 sys.path.insert(0, str(Path(__file__).parent))
@@ -53,4 +58,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

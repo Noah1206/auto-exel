@@ -62,6 +62,8 @@ _icon = str(_icon_icns) if (IS_MAC and _icon_icns.exists()) else (
     str(_icon_ico) if _icon_ico.exists() else None
 )
 
+# onefile 모드 (단일 실행파일). macOS .app 과 함께 쓰려면 main.py 에
+# multiprocessing.freeze_support() 가 반드시 호출되어야 함 (fork bomb 방지).
 exe = EXE(
     pyz,
     a.scripts,
