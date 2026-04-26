@@ -23,12 +23,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install pyinstaller
+          python -m pip install -r requirements-dev.txt
+          python -m pip install pyinstaller
+
+      - name: Show Python / PyInstaller info
+        run: |
+          python --version
+          python -c "import PySide6, sys; print('PySide6:', PySide6.__version__); print('python:', sys.executable)"
+          python -m PyInstaller --version
 
       - name: Build .exe
         run: |
-          pyinstaller build/build.spec --clean --noconfirm
+          python -m PyInstaller build/build.spec --clean --noconfirm
 
       - name: Verify build
         run: |

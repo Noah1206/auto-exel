@@ -10,9 +10,21 @@ if exist .venv\Scripts\activate.bat (
     call .venv\Scripts\activate.bat
 )
 
-where pyinstaller >nul 2>nul
+REM PyInstaller 가 없으면 자동 설치
+python -c "import PyInstaller" 2>nul
 if errorlevel 1 (
-    echo [ERROR] pyinstaller 가 설치되어 있지 않습니다. pip install pyinstaller
+    echo ==^> PyInstaller 설치 중...
+    python -m pip install pyinstaller
+    if errorlevel 1 (
+        echo [ERROR] PyInstaller 설치 실패
+        exit /b 1
+    )
+)
+
+REM PySide6 등 의존성 확인
+python -c "import PySide6" 2>nul
+if errorlevel 1 (
+    echo [ERROR] PySide6 가 설치되어 있지 않습니다. pip install -r requirements-dev.txt
     exit /b 1
 )
 
@@ -20,8 +32,8 @@ echo ==^> 이전 빌드 산출물 정리
 if exist build\build rmdir /s /q build\build
 if exist dist\11st_auto_order.exe del /q dist\11st_auto_order.exe
 
-echo ==^> PyInstaller 빌드
-pyinstaller build\build.spec --clean --noconfirm
+echo ==^> PyInstaller 빌드 (python -m PyInstaller 사용 - venv 안전)
+python -m PyInstaller build\build.spec --clean --noconfirm
 if errorlevel 1 (
     echo [ERROR] 빌드 실패
     exit /b 1

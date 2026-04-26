@@ -33,16 +33,26 @@ if [ -d ".venv" ]; then
   source .venv/bin/activate
 fi
 
-if ! command -v pyinstaller >/dev/null 2>&1; then
-  echo "[ERROR] pyinstaller 가 설치되어 있지 않습니다. pip install pyinstaller"
+# PyInstaller 자동 설치 (venv 의 python 기준)
+if ! python -c "import PyInstaller" 2>/dev/null; then
+  echo "==> PyInstaller 설치 중..."
+  python -m pip install pyinstaller
+fi
+
+# 의존성 확인
+if ! python -c "import PySide6" 2>/dev/null; then
+  echo "[ERROR] PySide6 가 설치되어 있지 않습니다. pip install -r requirements-dev.txt"
   exit 1
 fi
+
+echo "    python:      $(which python)"
+echo "    pyinstaller: $(python -m PyInstaller --version 2>&1)"
 
 echo "==> 이전 빌드 산출물 정리"
 rm -rf build/build dist/11st_auto_order dist/11st_auto_order.app
 
-echo "==> PyInstaller 빌드"
-pyinstaller build/build.spec --clean --noconfirm
+echo "==> PyInstaller 빌드 (python -m PyInstaller 사용 - venv 안전)"
+python -m PyInstaller build/build.spec --clean --noconfirm
 
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
