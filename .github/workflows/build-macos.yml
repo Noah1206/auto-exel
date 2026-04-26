@@ -6,6 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write   # Release 생성/업로드에 필요
+
 jobs:
   build-macos:
     runs-on: macos-latest  # Apple Silicon (arm64)
@@ -70,6 +73,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

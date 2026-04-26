@@ -6,6 +6,9 @@ on:
       - "v*"          # v1.0.0 같은 태그 푸시 시 자동 빌드 + 릴리스
   workflow_dispatch:  # 수동 실행 (Actions 탭에서 버튼 클릭)
 
+permissions:
+  contents: write   # Release 생성/업로드에 필요
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -66,6 +69,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
