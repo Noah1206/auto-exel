@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,20 @@ multiprocessing.freeze_support()
 
 # src 패키지 import 가능하도록
 sys.path.insert(0, str(Path(__file__).parent))
+
+# PyInstaller 동결 환경에선 작업 디렉토리가 / 같은 임의 위치라
+# 기존 코드의 상대경로(`data/state.json`, `data/chrome_profile/` 등)가
+# 권한 없는 곳을 가리킨다. 사용자 데이터 폴더로 chdir 해서 해결한다.
+if getattr(sys, "frozen", False):
+    if sys.platform == "darwin":
+        _user_data = Path.home() / "Library" / "Application Support" / "11st_auto_order"
+    elif sys.platform == "win32":
+        _appdata = os.environ.get("APPDATA")
+        _user_data = Path(_appdata) / "11st_auto_order" if _appdata else Path.home() / "11st_auto_order"
+    else:
+        _user_data = Path.home() / ".config" / "11st_auto_order"
+    _user_data.mkdir(parents=True, exist_ok=True)
+    os.chdir(_user_data)
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 

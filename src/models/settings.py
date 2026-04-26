@@ -7,6 +7,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from src.exceptions import ConfigError
+from src.utils.resource_path import resource_path, user_settings_path
 
 
 class ViewportConfig(BaseModel):
@@ -92,10 +93,18 @@ class AppSettings(BaseModel):
     @classmethod
     def load(
         cls,
-        user_path: str | Path = "config/settings.yaml",
-        default_path: str | Path = "config/default_settings.yaml",
+        user_path: str | Path | None = None,
+        default_path: str | Path | None = None,
     ) -> AppSettings:
-        """settings.yaml(사용자) 우선, 없으면 default_settings.yaml."""
+        """settings.yaml(사용자) 우선, 없으면 default_settings.yaml.
+
+        PyInstaller 동결 환경에선 user_path 는 ~/Library/Application Support/...,
+        default_path 는 _MEIPASS 안의 번들된 default_settings.yaml 을 가리킨다.
+        """
+        if user_path is None:
+            user_path = user_settings_path("settings.yaml")
+        if default_path is None:
+            default_path = resource_path("config", "default_settings.yaml")
         for path in (Path(user_path), Path(default_path)):
             if path.exists():
                 try:
@@ -107,7 +116,9 @@ class AppSettings(BaseModel):
         # 파일 둘 다 없으면 순수 기본값
         return cls()
 
-    def save(self, path: str | Path = "config/settings.yaml") -> None:
+    def save(self, path: str | Path | None = None) -> None:
+        if path is None:
+            path = user_settings_path("settings.yaml")
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as f:

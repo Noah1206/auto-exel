@@ -1,6 +1,7 @@
 """Playwright persistent context 관리."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -153,58 +154,50 @@ class BrowserManager:
     def is_running(self) -> bool:
         return self._context is not None
 
-    async def show_window(self, page: Page | None = None) -> None:
-        """크롬 창을 화면 안으로 이동만 시킨다 (포커스 절대 건드리지 않음).
+    async def _move_chrome_window(self, x: int, y: int) -> None:
+        """Chrome 창을 (x, y) 로 이동. macOS 는 osascript, Windows 는 PowerShell.
 
-        - position 만 이동, activate/frontmost 는 절대 호출하지 않음.
-        - Playwright Page.bring_to_front() 도 호출하지 않음 (이것도 포커스 이동).
-        - 사용자가 필요하면 직접 Cmd+Tab 으로 크롬을 선택.
+        포커스를 빼앗지 않도록 activate/frontmost 는 절대 호출하지 않는다.
+        실패해도 silently 무시 — 창 이동은 best-effort.
         """
+        import asyncio as _asyncio
         try:
-            import asyncio as _asyncio
-            # 중요: activate 없이, frontmost 설정 없이, 창 위치만 변경
-            script = (
-                'tell application "System Events"\n'
-                '  tell process "Google Chrome"\n'
-                '    try\n'
-                '      set position of window 1 to {100, 50}\n'
-                '    end try\n'
-                '  end tell\n'
-                'end tell'
-            )
-            proc = await _asyncio.create_subprocess_exec(
-                "osascript", "-e", script,
-                stdout=_asyncio.subprocess.DEVNULL,
-                stderr=_asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
+            if sys.platform == "darwin":
+                script = (
+                    'tell application "System Events"\n'
+                    '  tell process "Google Chrome"\n'
+                    '    try\n'
+                    f'      set position of window 1 to {{{x}, {y}}}\n'
+                    '    end try\n'
+                    '  end tell\n'
+                    'end tell'
+                )
+                proc = await _asyncio.create_subprocess_exec(
+                    "osascript", "-e", script,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+            elif sys.platform == "win32":
+                # Windows: 창 위치 변경은 launch_args 의 --window-position 으로 이미
+                # 처리되므로 런타임 이동은 no-op. (pywin32 의존성 추가 회피)
+                return
+            else:
+                # Linux: 창 매니저별로 다르므로 no-op
+                return
         except Exception as exc:
             log.debug(f"창 위치 이동 실패: {exc}")
+
+    async def show_window(self, page: Page | None = None) -> None:
+        """크롬 창을 화면 안으로 이동만 시킨다 (포커스 절대 건드리지 않음)."""
+        await self._move_chrome_window(100, 50)
 
     # 하위 호환 alias (UI 에서 기존 호출명 유지)
     bring_to_front = show_window
 
     async def hide_window(self) -> None:
         """창을 화면 밖으로 이동만 시킨다 (포커스 절대 건드리지 않음)."""
-        try:
-            import asyncio as _asyncio
-            script = (
-                'tell application "System Events"\n'
-                '  tell process "Google Chrome"\n'
-                '    try\n'
-                '      set position of window 1 to {-3000, 0}\n'
-                '    end try\n'
-                '  end tell\n'
-                'end tell'
-            )
-            proc = await _asyncio.create_subprocess_exec(
-                "osascript", "-e", script,
-                stdout=_asyncio.subprocess.DEVNULL,
-                stderr=_asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        except Exception as exc:
-            log.debug(f"창 숨기기 실패: {exc}")
+        await self._move_chrome_window(-3000, 0)
 
     async def get_or_create_page(self) -> Page:
         """컨텍스트의 첫 페이지 재사용(있으면) 또는 새로 생성."""

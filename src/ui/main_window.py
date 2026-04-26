@@ -73,7 +73,7 @@ class MainWindow(QMainWindow):
         self.browser = BrowserManager(
             settings.browser, stealth_enabled=settings.automation.stealth_enabled
         )
-        self.selectors = SelectorHelper("config/selectors.yaml")
+        self.selectors = SelectorHelper()
         self.state_mgr = StateManager()
         self.excel_mgr: ExcelManager | None = None
 

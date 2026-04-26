@@ -10,6 +10,7 @@ from playwright.async_api import TimeoutError as PwTimeout
 
 from src.exceptions import ConfigError, ElementNotFoundError
 from src.utils.logger import get_logger
+from src.utils.resource_path import resource_path
 
 log = get_logger()
 
@@ -17,8 +18,14 @@ log = get_logger()
 class SelectorHelper:
     """YAML 기반 셀렉터 조회 + fallback 탐색."""
 
-    def __init__(self, yaml_path: str | Path = "config/selectors.yaml"):
-        self.path = Path(yaml_path)
+    def __init__(self, yaml_path: str | Path | None = None):
+        if yaml_path is None:
+            self.path = resource_path("config", "selectors.yaml")
+        else:
+            self.path = Path(yaml_path)
+            # 상대경로면 번들 리소스 위치로 해석
+            if not self.path.is_absolute() and not self.path.exists():
+                self.path = resource_path(*self.path.parts)
         if not self.path.exists():
             raise ConfigError(f"selectors.yaml을 찾을 수 없습니다: {self.path}")
         try:
