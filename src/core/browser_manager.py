@@ -179,9 +179,33 @@ class BrowserManager:
                 )
                 await proc.wait()
             elif sys.platform == "win32":
-                # Windows: 창 위치 변경은 launch_args 의 --window-position 으로 이미
-                # 처리되므로 런타임 이동은 no-op. (pywin32 의존성 추가 회피)
-                return
+                # Windows: PowerShell + Win32 API 로 Chrome 창 이동.
+                # SW_SHOWNOACTIVATE(4) 로 포커스 빼앗지 않고 화면 안으로 이동.
+                # MoveWindow 로 좌표 변경. pywin32 의존성 없이 동작.
+                ps_script = (
+                    "$sig=@\"\n"
+                    "  [DllImport(\"user32.dll\")] public static extern bool MoveWindow(IntPtr hWnd,int X,int Y,int W,int H,bool R);\n"
+                    "  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd,int n);\n"
+                    "  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);\n"
+                    "  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd,out RECT r);\n"
+                    "  [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L;public int T;public int R;public int B;}\n"
+                    "\"@\n"
+                    "Add-Type -MemberDefinition $sig -Name W -Namespace U -UsingNamespace System.Runtime.InteropServices\n"
+                    "Get-Process chrome -ErrorAction SilentlyContinue | "
+                    "Where-Object {$_.MainWindowHandle -ne 0} | "
+                    "ForEach-Object {\n"
+                    f"  [U.W]::ShowWindow($_.MainWindowHandle, 4)\n"  # SW_SHOWNOACTIVATE
+                    f"  [U.W]::MoveWindow($_.MainWindowHandle, {x}, {y}, "
+                    f"{self.config.viewport.width}, {self.config.viewport.height}, $true)\n"
+                    "}"
+                )
+                proc = await _asyncio.create_subprocess_exec(
+                    "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                    "-Command", ps_script,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
             else:
                 # Linux: 창 매니저별로 다르므로 no-op
                 return
