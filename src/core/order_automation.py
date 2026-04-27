@@ -398,9 +398,14 @@ class OrderAutomation:
                 await self._ensure_logged_in(page)
                 await self._detect_abnormal(page)
 
-                # 수량 선택 (수량 > 1 일 때만 필수, 1이어도 시도는 함)
-                self._emit(order, OrderState.SELECT_QUANTITY, f"수량 {order.quantity} 선택")
-                await self._select_quantity(page, order)
+                # 사용자가 옵션을 선택할 때까지 대기 → 옵션이 사이드바에 추가되면
+                # 그 옵션의 수량을 엑셀의 수량으로 자동 조정
+                self._emit(
+                    order,
+                    OrderState.SELECT_QUANTITY,
+                    f"옵션 선택 대기 중... 옵션을 고르면 수량 {order.quantity} 로 자동 조정",
+                )
+                await self._wait_option_then_set_quantity(page, order)
 
                 self._checkpoints[order.row] = Checkpoint.AT_PRODUCT_PAGE
                 cp = Checkpoint.AT_PRODUCT_PAGE
@@ -542,6 +547,52 @@ class OrderAutomation:
         if await self.selectors.exists(page, "error_detection.captcha", timeout_ms=800):
             raise CaptchaDetectedError(
                 "캡차가 감지되었습니다. 브라우저에서 직접 해결 후 재시도하세요."
+            )
+
+    async def _wait_option_then_set_quantity(
+        self, page: Page, order: Order, timeout_sec: int = 1800
+    ) -> None:
+        """사용자가 옵션을 선택해서 사이드바에 추가될 때까지 대기.
+
+        그 후 사이드바의 +/- 버튼 또는 수량 input 으로 수량을 order.quantity 로 조정.
+
+        - 옵션이 없는 단일 상품(이미 사이드바에 떠 있음) 이면 즉시 수량 조정.
+        - 옵션이 있는 상품은 사용자가 선택할 때까지 0.5초 간격으로 폴링.
+        - 페이지가 닫히거나 timeout 초과 시 그냥 진행 (다음 단계가 알아서 처리).
+        """
+        qty = order.quantity
+        if qty <= 0:
+            return
+
+        elapsed = 0.0
+        poll = 0.5
+        sidebar_seen = False
+
+        while elapsed < timeout_sec:
+            if page.is_closed():
+                log.info(f"행{order.row}: 페이지 닫힘 → 옵션 대기 종료")
+                return
+            try:
+                cur = await self._read_current_quantity(page)
+            except Exception:
+                cur = None
+            if cur is not None:
+                # 사이드바/수량 input 이 활성 = 옵션이 추가된 상태
+                sidebar_seen = True
+                log.info(
+                    f"행{order.row}: 옵션 감지됨 (현재 수량={cur}) → "
+                    f"{qty} 로 조정 시도"
+                )
+                # 수량 조정
+                await self._select_quantity(page, order)
+                return
+            await asyncio.sleep(poll)
+            elapsed += poll
+
+        if not sidebar_seen:
+            log.warning(
+                f"행{order.row}: 옵션 대기 타임아웃 ({timeout_sec}s) — "
+                "사용자가 옵션을 선택하지 않음. 다음 단계로 진행"
             )
 
     async def _select_quantity(self, page: Page, order: Order) -> None:
