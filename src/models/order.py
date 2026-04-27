@@ -189,3 +189,41 @@ class Order(BaseModel):
         if m:
             text = m.group(1).strip()
         return text
+
+    def _split_address(self) -> tuple[str, str]:
+        """원본 주소를 (도로명+번지, 아파트명+동/호) 두 부분으로 분리.
+
+        규칙:
+          - 첫 번지수(숫자[-숫자]) 까지 = base
+          - 그 뒤 = detail (아파트명/동/호 등)
+          - 괄호 보조 텍스트 (예: "(통진읍, 어쩌고)") 는 제거
+          - 분리 못하면 (전체, "") 반환
+
+        예시:
+          '경기도 김포시 통진읍 율마로438번길 34-16 한스빌라 402호'
+            → ('경기도 김포시 통진읍 율마로438번길 34-16', '한스빌라 402호')
+          '서울 강남구 선릉로130길 20 (삼성동) 101동 503호'
+            → ('서울 강남구 선릉로130길 20', '101동 503호')
+        """
+        text = (self.address or "").strip()
+        if not text:
+            return "", ""
+        import re as _re
+        text = _re.sub(r"\s*\(.*?\)\s*", " ", text).strip()
+        text = _re.sub(r"\s+", " ", text)
+        m = _re.match(r"^(.*?\d+(?:-\d+)?)\b\s*(.*)$", text)
+        if not m:
+            return text, ""
+        base = m.group(1).strip()
+        detail = m.group(2).strip()
+        return base, detail
+
+    def address_base(self) -> str:
+        """주문서 '기본주소' 칸에 들어갈 값 — 도로명 + 번지수까지."""
+        base, _ = self._split_address()
+        return base or self.address
+
+    def address_detail(self) -> str:
+        """주문서 '상세주소' 칸에 들어갈 값 — 아파트명/동/호 등."""
+        _, detail = self._split_address()
+        return detail

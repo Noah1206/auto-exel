@@ -61,33 +61,54 @@ class BrowserManager:
                 f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
             ]
         elif sys.platform == "win32":
-            # Windows: 최대화로 띄워서 화면에 무조건 보이게 — 포커스도 자연스럽게 가져감.
-            launch_args.append("--start-maximized")
+            # Windows: maximized 만으론 멀티모니터/이전 좌표 기억 등으로
+            # 화면 밖에 뜰 수 있어 (0,0) 좌표 + 사이즈 명시 + maximized 동시 적용.
+            launch_args += [
+                "--window-position=0,0",
+                f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
+                "--start-maximized",
+            ]
         else:
             launch_args.append("--start-maximized")
 
-        try:
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile),
-                channel=self.config.channel,
-                headless=self.config.headless,
-                viewport={
-                    "width": self.config.viewport.width,
-                    "height": self.config.viewport.height,
-                },
-                locale=self.config.locale,
-                timezone_id=self.config.timezone,
-                args=launch_args,
-                # --enable-automation: stealth 위해 제거
-                # --disable-extensions: 사용자가 설치한 확장프로그램(샵백 등) 사용 위해 제거
-                ignore_default_args=["--enable-automation", "--disable-extensions"],
-            )
-        except Exception as exc:
+        # Windows: 시스템 Chrome 채널 fallback — chrome → chrome-beta → msedge.
+        # macOS/Linux 는 첫 시도만.
+        channels_to_try = [self.config.channel]
+        if sys.platform == "win32" and self.config.channel == "chrome":
+            channels_to_try += ["chrome-beta", "msedge"]
+
+        last_exc = None
+        for ch in channels_to_try:
+            try:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile),
+                    channel=ch,
+                    headless=self.config.headless,
+                    viewport={
+                        "width": self.config.viewport.width,
+                        "height": self.config.viewport.height,
+                    },
+                    locale=self.config.locale,
+                    timezone_id=self.config.timezone,
+                    args=launch_args,
+                    # --enable-automation: stealth 위해 제거
+                    # --disable-extensions: 사용자가 설치한 확장프로그램(샵백 등) 사용 위해 제거
+                    ignore_default_args=["--enable-automation", "--disable-extensions"],
+                )
+                if ch != self.config.channel:
+                    log.info(f"브라우저 채널 fallback 성공: {ch}")
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                log.warning(f"채널 {ch} 실행 실패: {exc} — 다음 채널 시도")
+
+        if last_exc is not None:
             await self._safe_stop_playwright()
             raise BrowserError(
-                f"Chrome 실행 실패 (channel={self.config.channel}): {exc}. "
-                f"시스템에 Chrome이 설치되어 있는지 확인하세요."
-            ) from exc
+                f"Chrome 실행 실패 (시도 채널: {channels_to_try}): {last_exc}. "
+                f"시스템에 Chrome 또는 Edge 가 설치되어 있는지 확인하세요."
+            ) from last_exc
 
         self._context.set_default_timeout(self.config.default_timeout_ms)
         self._context.set_default_navigation_timeout(self.config.navigation_timeout_ms)

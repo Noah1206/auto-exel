@@ -387,6 +387,13 @@ class ExcelManager:
         try:
             wb.save(tmp)
             tmp.replace(out)
+        except PermissionError as exc:
+            # Windows: Excel 이 파일을 잠그고 있는 경우.
+            raise ExcelError(
+                f"엑셀 저장 실패 — 파일이 다른 프로그램에서 열려 있습니다.\n"
+                f"Excel 에서 '{out.name}' 을 닫고 다시 시도하세요.\n"
+                f"원본 오류: {exc}"
+            ) from exc
         except Exception as exc:
             raise ExcelError(f"엑셀 저장 실패: {exc}") from exc
         finally:

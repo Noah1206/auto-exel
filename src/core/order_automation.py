@@ -485,7 +485,47 @@ class OrderAutomation:
                     OrderState.CLICK_BUY,
                     "Chrome 에서 '구매하기' 를 누르면 자동으로 주문서 입력이 시작됩니다",
                 )
-                await self._await_user_fill(order.row, page=page)
+
+                # 캐시백 활성화 → 리다이렉트로 상품 페이지 재진입 시 수량 리셋 방어.
+                # framenavigated 이벤트로 product URL 재진입 감지 → 수량 자동 재설정.
+                product_url = order.product_url
+
+                async def _on_nav_relisten():
+                    """현재 page 의 framenavigated 를 감지해 product 재진입 시 수량 재조정."""
+                    try:
+                        cur_url = (page.url or "").lower()
+                        # 11번가 상품 페이지 URL 패턴: /products/<숫자>
+                        if (
+                            "/products/" in cur_url
+                            and not page.is_closed()
+                        ):
+                            log.info(
+                                f"행{order.row}: 상품 페이지 재진입 감지 → 수량 재설정 시도"
+                            )
+                            try:
+                                await self._wait_option_then_set_quantity(
+                                    page, order, timeout_sec=60
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    f"행{order.row}: 재진입 수량 재설정 실패: {exc}"
+                                )
+                    except Exception:
+                        pass
+
+                def _on_framenavigated(frame):
+                    if frame is page.main_frame:
+                        # async 콜백을 background task 로 띄움
+                        asyncio.create_task(_on_nav_relisten())
+
+                page.on("framenavigated", _on_framenavigated)
+                try:
+                    await self._await_user_fill(order.row, page=page)
+                finally:
+                    try:
+                        page.remove_listener("framenavigated", _on_framenavigated)
+                    except Exception:
+                        pass
                 if page.is_closed():
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
@@ -511,17 +551,18 @@ class OrderAutomation:
                 # 4-a) 결제 직전 샵백 추적 검증
                 self._verify_shopback_before_payment(order)
 
-                # 결제·카드 인증 후 사용자가 직접 "다음으로" 를 눌러야 진행한다.
+                # 사용자가 결제하기 클릭 + 카드 인증 → 주문완료 페이지가 뜨면
+                # 자동 감지해 주문번호 추출. 별도 '다음으로' 클릭 불필요.
                 self._emit(
                     order,
                     OrderState.WAIT_PAYMENT,
-                    "결제 완료 후 상태칸의 '▶ 다음으로' 버튼을 눌러주세요",
+                    "결제 진행 후 자동으로 주문번호를 가져옵니다",
                 )
-                await self._await_user_next(order.row)
 
-                self._emit(order, OrderState.EXTRACT_ORDER_NO, "주문번호 추출 중")
+                self._emit(order, OrderState.EXTRACT_ORDER_NO, "결제 완료 대기 + 주문번호 추출 중")
+                # 카드 인증까지 시간 충분히 주기 위해 timeout 10분.
                 order_no, paid_amount = await self._wait_for_order_completion(
-                    page, timeout_sec=15
+                    page, timeout_sec=600
                 )
                 order.order_number = order_no
                 order.ordered_at = datetime.now()
@@ -1197,17 +1238,15 @@ class OrderAutomation:
         log.debug("직접입력 UI 없음 — 기본 흐름으로 진행")
 
     async def _fill_order_form(self, page: Page, order: Order) -> None:
-        """주문서 자동 입력 — 두 단계로 분리:
-
-        1단계 (이 함수에서 수행):
+        """주문서 자동 입력 — 한 번에 모든 필드 채움:
           - 직접입력 모드 전환
-          - 받는사람 / 우편번호 / 기본주소 / 상세주소 (주소찾기 팝업까지 자동)
+          - 받는사람 / 우편번호 / 기본주소 / 상세주소 (주소찾기 팝업 자동 처리)
           - 전화번호
-          - 그 후 사용자 '영문기입' 트리거 대기
-
-        2단계 (사용자가 '영문기입' 누르면):
           - 통관번호
           - 영문이름
+
+        주소찾기 자동 클릭 → 검색어 입력 → 결과 자동 선택 로직은
+        _ensure_address_filled() 안에서 그대로 수행한다.
         """
         delay = self.config.typing_delay_ms
 
@@ -1224,11 +1263,20 @@ class OrderAutomation:
         await self._force_fill(
             page, "order_page.zipcode_input", order.postal_code, delay
         )
-        await self._force_fill(
-            page, "order_page.address_base", order.address, delay
+        # 주소 입력 정책 (안전 우선):
+        #  - base 칸: 주소찾기 팝업이 채워줌 (행정 표준 도로명/지번)
+        #  - detail 칸: 원본 주소 전체 그대로 → 정보 손실 0
+        #  - 주소찾기 실패 시: base 에도 원본 전체 들어가 있어 최소 정보 보장
+        addr_full = order.address
+        log.info(
+            f"행{order.row}: 주소 입력 — base(임시)={addr_full!r} detail={addr_full!r}"
+            f" (주소찾기 후 base 는 자동 갱신됨)"
         )
         await self._force_fill(
-            page, "order_page.address_detail", order.address, delay
+            page, "order_page.address_base", addr_full, delay
+        )
+        await self._force_fill(
+            page, "order_page.address_detail", addr_full, delay
         )
 
         # 2-b) 주소찾기 팝업 자동 처리
@@ -1257,22 +1305,20 @@ class OrderAutomation:
                     page, "order_page.phone_suffix", parts[2], delay
                 )
 
-        # 4) 사용자가 '영문기입' 누를 때까지 대기 → 그 후 통관/영문 자동 입력
-        self._emit(
-            order,
-            OrderState.FILL_FORM,
-            "받는사람·주소·전화 입력 완료. 상태칸의 '영문기입' 버튼을 눌러주세요",
-        )
-        await self._await_user_eng_fill(order.row)
-
-        # 5) 통관번호 — 실패하면 주문을 실패시킨다
+        # 4) 통관번호 — 실패하면 주문을 실패시킨다
         self._emit(order, OrderState.FILL_FORM, "통관번호·영문이름 자동 입력 중")
         await self._fill_customs_id_or_fail(page, order)
 
-        # 6) 영문 이름 — 통합/분리/재시도/JS 강제 주입 4단계 fallback
+        # 5) 영문 이름 — 통합/분리/재시도/JS 강제 주입 4단계 fallback
         eng_name = (order.english_name or "").strip()
         if eng_name:
             await self._fill_english_name(page, eng_name, delay)
+
+        self._emit(
+            order,
+            OrderState.FILL_FORM,
+            "주문정보 자동 입력 완료. 결제하기 버튼을 눌러주세요",
+        )
 
     async def _ensure_address_filled(self, page: Page, order: Order) -> None:
         """주소 입력 — 주소찾기 팝업 자동 처리 + 라벨 보강.
@@ -1287,31 +1333,77 @@ class OrderAutomation:
         # 1) 주소찾기 버튼 자동 클릭 (팝업이 이미 떠있으면 스킵)
         popup_open = await self._is_address_popup_open(page)
         if not popup_open:
-            clicked = await self._click_address_search_button(page)
-            if clicked:
-                # 팝업이 뜰 때까지 잠깐 대기
-                for _ in range(15):
-                    await asyncio.sleep(0.2)
-                    if await self._is_address_popup_open(page):
-                        popup_open = True
-                        break
+            # popup window 가 열리는 이벤트를 미리 listener 로 등록 → 클릭 직후
+            # ctx.pages 에 안 보여도 'page' 이벤트로 즉시 잡을 수 있다.
+            # Windows 에서 child window 가 별도 프로세스로 분리되는 케이스 대응.
+            ctx = page.context
+            popup_future: asyncio.Future = asyncio.get_event_loop().create_future()
 
-        # 2~3) 팝업이 열렸으면 자동 검색 + 첫 결과 선택
-        if popup_open:
+            def _on_new_page(p):
+                if not popup_future.done():
+                    popup_future.set_result(p)
+
+            ctx.on("page", _on_new_page)
             try:
-                query = order.address_search_query() or order.postal_code
-                ok = await self._auto_search_and_pick_address(page, query)
-                if ok:
-                    log.info(
-                        f"행{order.row}: 주소찾기 팝업 자동 검색·선택 완료 ({query!r})"
-                    )
-                    await asyncio.sleep(0.4)
-                else:
-                    log.warning(
-                        f"행{order.row}: 주소찾기 팝업 자동 처리 실패 — 사용자가 직접 선택"
-                    )
-            except Exception as exc:
-                log.debug(f"행{order.row}: 주소찾기 팝업 자동 처리 예외: {exc}")
+                clicked = await self._click_address_search_button(page)
+                if clicked:
+                    # 1) 이벤트로 popup 잡기 시도 (최대 6초)
+                    try:
+                        new_p = await asyncio.wait_for(popup_future, timeout=6.0)
+                        log.info(
+                            f"행{order.row}: 주소찾기 popup 이벤트 감지 → "
+                            f"URL={new_p.url[:80]}"
+                        )
+                        try:
+                            await new_p.wait_for_load_state(
+                                "domcontentloaded", timeout=3000
+                            )
+                        except Exception:
+                            pass
+                        popup_open = True
+                    except asyncio.TimeoutError:
+                        # 2) 이벤트 못 잡았으면 polling fallback
+                        for _ in range(30):
+                            await asyncio.sleep(0.2)
+                            if await self._is_address_popup_open(page):
+                                popup_open = True
+                                log.info(f"행{order.row}: 주소찾기 팝업 polling 감지됨")
+                                break
+                        else:
+                            log.warning(
+                                f"행{order.row}: 주소찾기 팝업이 12초 내 감지되지 않음 — "
+                                "그래도 자동 검색·선택 시도"
+                            )
+            finally:
+                try:
+                    ctx.remove_listener("page", _on_new_page)
+                except Exception:
+                    pass
+
+        # 2~3) 팝업 감지 여부와 무관하게 자동 검색 + 결과 선택 시도.
+        # popup_open=False 라도 별도 창/iframe 어딘가에는 있을 수 있어서.
+        try:
+            query = order.address_search_query() or order.postal_code
+            log.info(
+                f"행{order.row}: 주소찾기 검색·선택 시작 query={query!r} "
+                f"postal={order.postal_code!r}"
+            )
+            ok = await self._auto_search_and_pick_address(
+                page, query,
+                postal=order.postal_code,
+                base_addr=order.address_base(),
+            )
+            if ok:
+                log.info(
+                    f"행{order.row}: 주소찾기 팝업 자동 검색·선택 완료 ({query!r})"
+                )
+                await asyncio.sleep(0.4)
+            else:
+                log.warning(
+                    f"행{order.row}: 주소찾기 자동 처리 실패 — 사용자가 직접 선택"
+                )
+        except Exception as exc:
+            log.warning(f"행{order.row}: 주소찾기 자동 처리 예외: {exc}")
 
         # 4~5) 상세주소 + 비어있는 칸 라벨에 강제 주입
         await self._js_inject_address_fields(page, order)
@@ -1339,9 +1431,31 @@ class OrderAutomation:
                     f"base={status.get('base')!r} "
                     f"detail={status.get('detail')!r}"
                 )
-                if not (status.get("postal") and status.get("base") and status.get("detail")):
-                    log.info(f"행{order.row}: 주소 일부 비어있음 → 재주입")
+                # 일부 비어있으면 최대 3회 재주입 (Windows 환경 detail 칸 누락 케이스 방어)
+                for retry in range(3):
+                    if status.get("postal") and status.get("base") and status.get("detail"):
+                        break
+                    log.info(
+                        f"행{order.row}: 주소 일부 비어있음 → 재주입 (시도 {retry + 1}/3)"
+                    )
                     await self._js_inject_address_fields(page, order)
+                    await asyncio.sleep(0.3)
+                    try:
+                        status = await page.evaluate(
+                            r"""() => {
+                              function val(sel) {
+                                const el = document.querySelector(sel);
+                                return el ? (el.value || '').trim() : null;
+                              }
+                              return {
+                                postal: val('input[name="zipcodeTxt"], input[name="rcvrZipNo"], input[name="zipCd"], input[placeholder*="우편번호"]'),
+                                base:   val('input[name="rcvrBaseAddr"], input[name="baseAddr"], input[name="addr"], input[placeholder*="기본 주소"]'),
+                                detail: val('input[name="rcvrDtlsAddr"], input[name="addrDtl"], input[name="dtlsAddr"], input[placeholder*="상세"]'),
+                              };
+                            }"""
+                        )
+                    except Exception:
+                        break
         except Exception:
             pass
 
@@ -1396,14 +1510,28 @@ class OrderAutomation:
         out: list[Page] = []
         try:
             ctx = page.context
+            all_urls = []
             for p in ctx.pages:
                 if p is page or p.is_closed():
                     continue
-                url = p.url or ""
-                if "/addr/" in url or "searchAddr" in url or "zipcode" in url.lower():
+                url = (p.url or "").lower()
+                all_urls.append(url[:80])
+                # 11번가 주소찾기 popup URL 패턴 (소문자 비교)
+                if (
+                    "/addr/" in url
+                    or "searchaddr" in url
+                    or "zipcode" in url
+                    or "post" in url
+                    or "popup" in url
+                    or "주소" in url  # 한글 URL 가능성
+                ):
                     out.append(p)
-        except Exception:
-            pass
+            log.info(
+                f"_find_address_popup_pages: 컨텍스트 page 개수={len(ctx.pages)}, "
+                f"매칭={len(out)}, 다른 page URL들={all_urls}"
+            )
+        except Exception as exc:
+            log.warning(f"_find_address_popup_pages 예외: {exc}")
         return out
 
     async def _click_address_search_button(self, page: Page) -> bool:
@@ -1445,9 +1573,15 @@ class OrderAutomation:
         return False
 
     async def _auto_search_and_pick_address(
-        self, page: Page, query: str
+        self, page: Page, query: str, postal: str = "", base_addr: str = "",
     ) -> bool:
-        """팝업에서 query 로 자동 검색 + 첫 결과 자동 클릭.
+        """팝업에서 query 로 자동 검색 + 결과 자동 선택.
+
+        선택 우선순위:
+          1) 우편번호(postal) 일치
+          2) base_addr 토큰 매칭이 가장 많은 항목 (60% 이상)
+          3) '도로명' 라벨 있는 첫 항목
+          4) 첫 결과
 
         팝업 형태:
           A) inline layer / 같은 페이지 iframe
@@ -1516,69 +1650,240 @@ class OrderAutomation:
 """
 
         pick_js = r"""
-() => {
+([postal, baseAddr]) => {
   function visible(el) {
     const cs = window.getComputedStyle(el);
     if (cs.display === 'none' || cs.visibility === 'hidden') return false;
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   }
-  // 결과 목록
-  const cands = document.querySelectorAll(
-    '.search_result_box a, .search_result_box li, '
-    + '#searchResultBox a, #searchResultBox li, '
-    + '.layer_addr a, .layer_addr li, '
-    + '[class*="AddressSearch" i] a, [class*="AddressSearch" i] li, '
-    + '[class*="result" i] a, [class*="result" i] li, '
-    + 'ul[class*="addr" i] li, '
-    + '[role="listitem"]'
-  );
-  // 도로명 우선
-  for (const el of cands) {
-    if (!visible(el)) continue;
-    const t = (el.innerText || '').trim();
-    if (!t) continue;
-    if (/도로명/.test(t)) {
-      try { el.click(); return 'road:' + t.slice(0, 40); } catch(e) {}
+
+  // 컨테이너: 한 결과 행(도로명+지번+우편번호 묶음).
+  // 11번가 popup 의 실제 DOM: <a onclick="$.fn_setAddr('road',...)"> 가
+  // 실제 클릭 대상이므로 모든 'fn_setAddr' onclick 을 가진 a 를 직접 모은다.
+  let containers = Array.from(document.querySelectorAll(
+    'a[onclick*="fn_setAddr"], a[onclick*="setAddr"], '
+    + 'a[onclick*="selectAddr"], a[onclick*="chooseAddr"]'
+  )).filter(visible);
+
+  // 위 직접 매칭이 0개면 컨테이너 셀렉터로 fallback
+  if (containers.length === 0) {
+    containers = Array.from(document.querySelectorAll(
+      '#roadList tr, #jibunList tr, '
+      + 'tbody#roadList > tr, tbody#jibunList > tr, '
+      + '.search_result_box tr, .search_result_box li, '
+      + '#searchResultBox tr, #searchResultBox li, '
+      + '.layer_addr li, .layer_addr tr, '
+      + '.list_box tr, .list_box li, '
+      + '.result_list_box tr, .result_list_box li, '
+      + '[class*="AddressSearch" i] li, '
+      + '[class*="AddressSearch" i] tr, '
+      + '[class*="result" i] li, '
+      + '[class*="result" i] tr, '
+      + 'ul[class*="addr" i] li, '
+      + '[role="listitem"]'
+    )).filter(visible);
+  }
+
+  // 진단용: 컨테이너 개수와 첫 항목 미리 수집
+  const _diag = {
+    count: containers.length,
+    first: containers.length > 0
+      ? (containers[0].innerText || '').replace(/\s+/g, ' ').slice(0, 80)
+      : null,
+  };
+
+  function fire(el) {
+    // 11번가 popup 의 <a onclick="$.fn_setAddr(...)"> 는 onclick 속성이
+    // jQuery 가 아닌 inline handler 라 el.click() 이 잘 안 먹힘.
+    // 1) onclick 속성을 직접 평가 → 2) 그래도 안 되면 mousedown/mouseup/click 시뮬.
+    if (!el) return false;
+    try {
+      const onc = el.getAttribute('onclick');
+      if (onc) {
+        // 'this' 컨텍스트가 필요한 경우를 위해 Function('return ...').call(el)
+        try { (new Function(onc)).call(el); return true; } catch(e) {}
+      }
+    } catch(e) {}
+    try { el.click(); return true; } catch(e) {}
+    try {
+      ['mousedown','mouseup','click'].forEach(t => {
+        el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true}));
+      });
+      return true;
+    } catch(e) {}
+    return false;
+  }
+
+  function pick(container, label) {
+    // 컨테이너에서 진짜 클릭해야 할 요소 결정 — onclick 가진 a 가 우선.
+    // 컨테이너 자체가 이미 a/button 이면 그걸 그대로 사용.
+    let target;
+    if (container.matches && container.matches('a, button, [role="button"]')) {
+      target = container;
+    } else {
+      target = container.querySelector('a[onclick], button[onclick]')
+            || container.querySelector('a, button, [role="button"]')
+            || container;
+    }
+    const ok = fire(target);
+    if (ok) {
+      const t = (container.innerText || '').replace(/\s+/g, ' ').slice(0, 80);
+      return label + ':' + t;
+    }
+    return null;
+  }
+
+  // 컨테이너 텍스트 — 자기 자신이 a 면 부모 tr/li 전체 텍스트도 봐야 우편번호 매칭됨
+  function fullText(el) {
+    let cur = el;
+    for (let i = 0; cur && i < 4; i++) {
+      const tag = cur.tagName;
+      if (tag === 'TR' || tag === 'LI') return cur.innerText || '';
+      cur = cur.parentElement;
+    }
+    return el.innerText || '';
+  }
+
+  // 1) 우편번호 일치 항목 우선
+  if (postal) {
+    for (const el of containers) {
+      const t = fullText(el).replace(/\s+/g, ' ');
+      if (t.includes(postal)) {
+        const r = pick(el, 'postal-match');
+        if (r) return r;
+      }
     }
   }
-  for (const el of cands) {
-    if (!visible(el)) continue;
+
+  // 2) baseAddr 토큰 매칭이 가장 많은 항목
+  if (baseAddr) {
+    const tokens = baseAddr.split(/\s+/).filter(t => t.length >= 1);
+    let best = null, bestScore = 0;
+    for (const el of containers) {
+      const t = fullText(el);
+      let score = 0;
+      for (const tok of tokens) if (t.includes(tok)) score++;
+      if (score > bestScore) { bestScore = score; best = el; }
+    }
+    if (best && bestScore >= Math.ceil(tokens.length * 0.6)) {
+      const r = pick(best, 'addr-match(' + bestScore + '/' + tokens.length + ')');
+      if (r) return r;
+    }
+  }
+
+  // 3) '도로명' 라벨 가진 첫 항목
+  for (const el of containers) {
+    const t = (el.innerText || '').trim();
+    if (/도로명/.test(t)) {
+      const r = pick(el, 'road');
+      if (r) return r;
+    }
+  }
+
+  // 4) 첫 결과
+  for (const el of containers) {
     const t = (el.innerText || '').trim();
     if (!t || t.length < 6) continue;
-    try { el.click(); return 'pick:' + t.slice(0, 40); } catch(e) {}
+    const r = pick(el, 'first');
+    if (r) return r;
   }
-  return null;
+  // 결과 0건이거나 모두 클릭 실패 → 진단 정보 반환
+  return 'no-pick(count=' + _diag.count + ', first=' + (_diag.first || '?') + ')';
 }
 """
 
         async def try_in_context(target) -> bool:
-            """target 은 Page 또는 Frame. 검색 + 결과 선택 시도."""
+            """target 은 Page 또는 Frame. 검색 + 결과 선택 시도.
+
+            견고함을 위한 polling 전략:
+              1) 검색창 등장 대기 — 최대 8초 (팝업이 천천히 로드돼도 잡음)
+              2) 검색 입력·실행 — 검색창이 잡히면 1회 시도
+              3) 결과 등장 + 선택 polling — 최대 15초 (느린 네트워크 대응)
+              4) 결과가 안 뜨면 검색 재시도 (최대 3회) — 첫 시도가 너무 빨라
+                 input 이 아직 React 상태 갱신 안 한 케이스 방어
+            """
             try:
-                r = await target.evaluate(search_js, [query])
-                log.debug(f"주소찾기 검색 시도 ({getattr(target, 'url', lambda: '')()}): {r}")
-                if r == 'no-input':
-                    return False
-            except Exception as exc:
-                log.debug(f"주소찾기 검색 JS 실패: {exc}")
-                return False
-            # 결과 로딩 대기
-            await asyncio.sleep(1.0)
-            try:
-                r2 = await target.evaluate(pick_js)
-                if r2:
-                    log.info(f"주소찾기 결과 선택: {r2}")
-                    return True
+                ctx_url = ""
+                try:
+                    ctx_url = target.url if not callable(target.url) else target.url()
+                except Exception:
+                    pass
+                log.info(f"주소찾기 try_in_context 시작 ({ctx_url[:80]})")
             except Exception:
-                return False
+                pass
+
+            # 1) 검색창 등장 대기 + 검색 실행 — 최대 3회 재시도
+            search_ok = False
+            for search_attempt in range(3):
+                # 검색창이 나타날 때까지 polling (최대 8초)
+                input_ready = False
+                for _ in range(40):
+                    try:
+                        r = await target.evaluate(search_js, [query])
+                    except Exception as exc:
+                        log.debug(f"search_js 실패: {exc}")
+                        await asyncio.sleep(0.2)
+                        continue
+                    if r == 'no-input':
+                        await asyncio.sleep(0.2)
+                        continue
+                    log.info(
+                        f"주소찾기 검색 결과 (시도 {search_attempt + 1}/3): {r}"
+                    )
+                    input_ready = True
+                    search_ok = True
+                    break
+                if not input_ready:
+                    log.warning(f"주소찾기 검색창이 8초 내 안 잡힘 (재시도 {search_attempt + 1}/3)")
+                    return False
+
+                # 2) 결과 등장 + 선택 polling (최대 15초)
+                last_diag = None
+                got_result = False
+                for attempt in range(30):
+                    await asyncio.sleep(0.5)
+                    try:
+                        r2 = await target.evaluate(pick_js, [postal, base_addr])
+                    except Exception as exc:
+                        log.debug(f"pick_js 실패 (attempt {attempt}): {exc}")
+                        continue
+                    if r2 and not r2.startswith('no-pick'):
+                        log.info(f"주소찾기 결과 선택 성공: {r2}")
+                        return True
+                    last_diag = r2
+                    # no-pick(count=N, ...) 에서 count > 0 이면 결과는 떴으니
+                    # 클릭 fail 만 한 것 → 더 polling 한다고 결과 안 바뀜.
+                    if r2 and 'count=' in r2 and 'count=0' not in r2:
+                        got_result = True
+
+                if got_result:
+                    log.warning(
+                        f"주소찾기: 결과는 떴지만 클릭 실패 — {last_diag}"
+                    )
+                    return False
+                # 결과 자체가 0건 → 검색 재시도 (검색이 너무 빨라 입력 안 먹은 케이스)
+                log.info(
+                    f"주소찾기: 결과 0건, 검색 재시도 — last={last_diag}"
+                )
+                await asyncio.sleep(0.5)
+
+            log.warning("주소찾기 결과 선택 최종 실패")
             return False
 
-        # 1) 별도 popup window 우선 (가장 흔한 케이스)
-        for popup_page in await self._find_address_popup_pages(page):
+        # 1) 별도 popup window — 늦게 뜰 수 있어 최대 8초 polling 으로 대기
+        popup_pages: list[Page] = []
+        for _ in range(40):
+            popup_pages = await self._find_address_popup_pages(page)
+            if popup_pages:
+                break
+            await asyncio.sleep(0.2)
+
+        for popup_page in popup_pages:
             try:
-                # popup 이 완전 로드되기까지 대기
+                # popup 이 완전 로드되기까지 대기 (timeout 5초로 확장)
                 await popup_page.wait_for_load_state(
-                    "domcontentloaded", timeout=3000
+                    "domcontentloaded", timeout=5000
                 )
             except Exception:
                 pass
@@ -1609,9 +1914,12 @@ class OrderAutomation:
         - placeholder/name/id/aria-label 어디든 매칭되면 주입
         - input/change 이벤트 dispatch (React/Vue 의 controlled input 도 동작)
         """
+        # detail 에 원본 주소 전체. base 도 우선 원본 주소(주소찾기가 갱신).
+        addr_base = order.address
+        addr_detail = order.address
         try:
             touched = await page.evaluate(
-                r"""([postal, address]) => {
+                r"""([postal, baseAddr, detailAddr]) => {
                   function setVal(el, v) {
                     try { el.removeAttribute('readonly'); } catch(e){}
                     try { el.removeAttribute('disabled'); } catch(e){}
@@ -1640,26 +1948,28 @@ class OrderAutomation:
                     }
                     // 상세주소 (먼저 매칭 — 'addr' 매칭이 base 로 빠지지 않게)
                     if (/(상세.*주소|상세.*건물|addr.*dtl|dtls.*addr|addrDetail|rcvrDtls)/i.test(hay)) {
-                      setVal(el, address);
-                      touched.push('detail:' + (el.name || el.id || el.placeholder));
+                      if (detailAddr) {
+                        setVal(el, detailAddr);
+                        touched.push('detail:' + (el.name || el.id || el.placeholder));
+                      }
                       continue;
                     }
                     // 기본주소
                     if (/(기본.*주소|base.*addr|baseAddr|rcvrBaseAddr|^addr$|pickupBaseAddr)/i.test(hay)) {
-                      setVal(el, address);
+                      setVal(el, baseAddr);
                       touched.push('base:' + (el.name || el.id || el.placeholder));
                       continue;
                     }
                     // 그 외 'addr' 가 들어가 있으면 일단 base 로 간주 (가장 마지막 fallback)
                     if (/addr|주소/i.test(hay) && !el.value) {
-                      setVal(el, address);
+                      setVal(el, baseAddr);
                       touched.push('addr-fallback:' + (el.name || el.id || el.placeholder));
                       continue;
                     }
                   }
                   return touched;
                 }""",
-                [order.postal_code, order.address],
+                [order.postal_code, addr_base, addr_detail],
             )
             if touched:
                 log.info(f"행{order.row}: 주소 JS 강제 주입: {touched}")
@@ -2492,13 +2802,13 @@ class OrderAutomation:
       touched.push('eng:' + (el.name || el.id || el.placeholder));
       continue;
     }
-    // 상세주소
+    // 상세주소 — 원본 주소 전체 (정보 손실 0)
     if (/(상세.*주소|상세.*건물|addr.*dtl|dtls.*addr|addrDetail)/i.test(hay)) {
       setVal(el, order.address);
       touched.push('addr_dtl:' + (el.name || el.id || el.placeholder));
       continue;
     }
-    // 기본주소
+    // 기본주소 — 일단 원본 주소 (주소찾기 결과가 자동 갱신함)
     if (/(기본.*주소|base.*addr|baseAddr|rcvrBaseAddr)/i.test(hay)) {
       setVal(el, order.address);
       touched.push('addr_base:' + (el.name || el.id || el.placeholder));
@@ -2533,6 +2843,8 @@ class OrderAutomation:
             "suffix": suffix,
             "postal_code": order.postal_code,
             "address": order.address,
+            "address_base": order.address_base(),
+            "address_detail": order.address_detail(),
             "customs_id": order.customs_id,
             "english_name": order.english_name,
             "only_postal": only_postal,

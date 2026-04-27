@@ -220,24 +220,13 @@ class MainWindow(QMainWindow):
                 f"행 {order.row}: '기입' 신호 전송 — 주문서 자동 입력 중...", 4000
             )
 
+        # '영문기입' 단계는 제거 — '기입' 한 번에 모든 필드 채움.
+        # StatusDelegate 가 콜백을 요구하므로 항상 False 반환하는 stub 전달.
         def _is_awaiting_eng_fill(idx) -> bool:
-            order = self._order_for_index(idx)
-            if order is None or self.automation is None:
-                return False
-            try:
-                return self.automation.is_awaiting_eng_fill(order.row)
-            except Exception:
-                return False
+            return False
 
         def _on_eng_fill(idx) -> None:
-            order = self._order_for_index(idx)
-            if order is None or self.automation is None:
-                return
-            self.automation.signal_eng_fill(order.row)
-            self.statusBar().showMessage(
-                f"행 {order.row}: '영문기입' 신호 전송 — 통관·영문 자동 입력 중...",
-                4000,
-            )
+            pass
 
         self._status_delegate = StatusDelegate(
             self.table,
@@ -451,13 +440,6 @@ class MainWindow(QMainWindow):
         )
         self.action_fill.triggered.connect(self._on_fill_clicked_toolbar)
 
-        # 영문기입 — 통관/영문/나머지 자동 입력 트리거
-        self.action_eng_fill = QAction("영문기입", self)
-        self.action_eng_fill.setToolTip(
-            "받는사람·주소 입력 후, 통관번호·영문이름 등 나머지를 자동 입력합니다"
-        )
-        self.action_eng_fill.triggered.connect(self._on_eng_fill_clicked_toolbar)
-
         # 주문번호 가져오기 — 결제 완료 후 주문번호 추출 트리거
         self.action_next = QAction("주문번호 가져오기", self)
         self.action_next.setToolTip(
@@ -499,8 +481,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.action_save_original)  # 원본에 저장
         tb.addAction(self.action_scrape)         # 가격 조회
-        tb.addAction(self.action_fill)           # 기입 (받는사람/주소/전화)
-        tb.addAction(self.action_eng_fill)       # 영문기입 (통관/영문/나머지)
+        tb.addAction(self.action_fill)           # 기입 (모든 필드 한 번에)
         tb.addAction(self.action_next)           # 주문번호 가져오기 (결제 후)
 
         # 초기: 엑셀 미로드 상태이므로 툴바 숨김
@@ -970,37 +951,6 @@ class MainWindow(QMainWindow):
             f"행 {rows_str}: '기입' 신호 전송 — 주문서 자동 입력 중...", 4000
         )
         log.info(f"툴바 기입 클릭 → 행 {rows_str} 에 신호 전송")
-
-    def _on_eng_fill_clicked_toolbar(self) -> None:
-        """툴바 '영문기입' 버튼 — 통관/영문 자동 입력 신호 전송."""
-        if self.automation is None:
-            self.statusBar().showMessage(
-                "주문이 시작된 행이 없습니다", 4000,
-            )
-            return
-        selected = self._selected_orders()
-        targets = [
-            o for o in selected
-            if self.automation.is_awaiting_eng_fill(o.row)
-        ]
-        if not targets:
-            for r in self.model.all_rows():
-                if isinstance(r, Order) and self.automation.is_awaiting_eng_fill(r.row):
-                    targets.append(r)
-        if not targets:
-            self.statusBar().showMessage(
-                "영문기입 대기 중인 행이 없습니다 (먼저 '기입' 버튼을 누르세요)",
-                4000,
-            )
-            return
-        for o in targets:
-            self.automation.signal_eng_fill(o.row)
-        rows_str = ", ".join(str(o.row) for o in targets)
-        self.statusBar().showMessage(
-            f"행 {rows_str}: '영문기입' 신호 전송 — 통관·영문 자동 입력 중...",
-            4000,
-        )
-        log.info(f"툴바 영문기입 클릭 → 행 {rows_str} 에 신호 전송")
 
     def _on_next_clicked_toolbar(self) -> None:
         """툴바 '주문번호 가져오기' 버튼 — 결제 완료 후 주문번호 추출 신호 전송."""

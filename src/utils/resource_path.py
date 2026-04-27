@@ -39,11 +39,20 @@ def resource_path(*parts: str) -> Path:
     return base.joinpath(*parts)
 
 
+def _has_non_ascii(p: Path) -> bool:
+    """경로에 비-ASCII 문자(한글 등) 가 있는지 검사."""
+    try:
+        str(p).encode("ascii")
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
 def user_data_dir(app_name: str = "11st_auto_order") -> Path:
     """사용자별 쓰기 가능 데이터 폴더 (settings.yaml, logs 등).
 
     macOS: ~/Library/Application Support/<app_name>
-    Windows: %APPDATA%/<app_name>
+    Windows: %APPDATA%/<app_name> (한글 사용자명이면 C:\\11st_auto_order 로 fallback)
     Linux: ~/.config/<app_name>
     """
     if sys.platform == "darwin":
@@ -51,6 +60,18 @@ def user_data_dir(app_name: str = "11st_auto_order") -> Path:
     elif sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         base = Path(appdata) / app_name if appdata else Path.home() / app_name
+        # 한글 사용자명 등 ASCII 외 경로면 일부 라이브러리(특히 Chrome) 가 실패 →
+        # ProgramData 또는 C:\ 직하로 fallback. PUBLIC 환경변수도 대안.
+        if _has_non_ascii(base):
+            programdata = os.environ.get("PROGRAMDATA") or "C:\\ProgramData"
+            fallback = Path(programdata) / app_name
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+                base = fallback
+            except Exception:
+                # 마지막 fallback: 임시 디렉토리
+                import tempfile
+                base = Path(tempfile.gettempdir()) / app_name
     else:
         base = Path.home() / ".config" / app_name
     base.mkdir(parents=True, exist_ok=True)
