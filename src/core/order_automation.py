@@ -1069,20 +1069,49 @@ class OrderAutomation:
             await self._fill_english_name(page, eng_name, delay)
 
     async def _ensure_address_filled(self, page: Page, order: Order) -> None:
-        """주소 입력 — 주소찾기 팝업 절대 열지 않고 라벨에 직접 다 주입.
+        """주소 입력 — 주소찾기 팝업 자동 처리 + 라벨 보강.
 
         흐름:
-          1) JS 로 우편/기본주소/상세주소 라벨에 강제 주입 (readonly 해제 + 값 세팅)
-          2) 입력 후 비어있는 칸이 있으면 한 번 더 재시도
-          3) 결과를 로그에 남김. 사용자 개입 모달/팝업 절대 없음.
+          1) 주소찾기 버튼 자동 클릭 → 팝업 오픈
+          2) 팝업 검색창에 검색용 주소(시/도 제외) 자동 입력 + 검색 클릭
+          3) 검색 결과 첫 번째 항목 자동 선택 (도로명 우선, 없으면 지번)
+          4) 팝업 닫힌 후 상세주소 input 에 수취인 주소 전체 자동 주입
+          5) 우편/기본주소도 비어있으면 JS 강제 주입 (안전망)
         """
-        # 1) JS 로 라벨에 강제 주입
+        # 1) 주소찾기 버튼 자동 클릭 (팝업이 이미 떠있으면 스킵)
+        popup_open = await self._is_address_popup_open(page)
+        if not popup_open:
+            clicked = await self._click_address_search_button(page)
+            if clicked:
+                # 팝업이 뜰 때까지 잠깐 대기
+                for _ in range(15):
+                    await asyncio.sleep(0.2)
+                    if await self._is_address_popup_open(page):
+                        popup_open = True
+                        break
+
+        # 2~3) 팝업이 열렸으면 자동 검색 + 첫 결과 선택
+        if popup_open:
+            try:
+                query = order.address_search_query() or order.postal_code
+                ok = await self._auto_search_and_pick_address(page, query)
+                if ok:
+                    log.info(
+                        f"행{order.row}: 주소찾기 팝업 자동 검색·선택 완료 ({query!r})"
+                    )
+                    await asyncio.sleep(0.4)
+                else:
+                    log.warning(
+                        f"행{order.row}: 주소찾기 팝업 자동 처리 실패 — 사용자가 직접 선택"
+                    )
+            except Exception as exc:
+                log.debug(f"행{order.row}: 주소찾기 팝업 자동 처리 예외: {exc}")
+
+        # 4~5) 상세주소 + 비어있는 칸 라벨에 강제 주입
         await self._js_inject_address_fields(page, order)
+        await asyncio.sleep(0.2)
 
-        # 잠깐 대기 후 검증 (React/Vue 등 비동기 렌더 대비)
-        await asyncio.sleep(0.3)
-
-        # 2) 점검 — 비어있는 칸이 있으면 재시도
+        # 점검 로그
         try:
             status = await page.evaluate(
                 r"""() => {
@@ -1097,25 +1126,220 @@ class OrderAutomation:
                   };
                 }"""
             )
+            if status:
+                log.info(
+                    f"행{order.row}: 주소 점검 — "
+                    f"postal={status.get('postal')!r} "
+                    f"base={status.get('base')!r} "
+                    f"detail={status.get('detail')!r}"
+                )
+                if not (status.get("postal") and status.get("base") and status.get("detail")):
+                    log.info(f"행{order.row}: 주소 일부 비어있음 → 재주입")
+                    await self._js_inject_address_fields(page, order)
         except Exception:
-            status = None
+            pass
 
-        if status:
-            log.info(
-                f"행{order.row}: 주소 점검 — "
-                f"postal={status.get('postal')!r} "
-                f"base={status.get('base')!r} "
-                f"detail={status.get('detail')!r}"
+    async def _is_address_popup_open(self, page: Page) -> bool:
+        """주소찾기 팝업(레이어/iframe) 이 열려있는지."""
+        try:
+            return await page.evaluate(
+                r"""() => {
+                  // 1) iframe (zipcode 관련)
+                  for (const f of document.querySelectorAll('iframe')) {
+                    const n = (f.name || f.id || '').toLowerCase();
+                    if (/zip|addr|post/i.test(n)) return true;
+                  }
+                  // 2) 인라인 레이어
+                  const layers = document.querySelectorAll(
+                    '.layer_addr, [class*="AddressSearch" i], [class*="addr_search" i], '
+                    + '[class*="addressLayer" i]'
+                  );
+                  for (const l of layers) {
+                    const cs = window.getComputedStyle(l);
+                    if (cs.display !== 'none' && cs.visibility !== 'hidden') return true;
+                  }
+                  // 3) '주소 찾기' 헤더가 보이는 모달
+                  const heads = document.querySelectorAll('h1, h2, h3, h4, .layer_title, .modal_title');
+                  for (const h of heads) {
+                    const t = (h.innerText || '').trim();
+                    if (/^주소\s*찾기$/.test(t)) {
+                      const cs = window.getComputedStyle(h);
+                      if (cs.display !== 'none' && cs.visibility !== 'hidden') return true;
+                    }
+                  }
+                  return false;
+                }"""
             )
-            # 비어있는 칸이 있으면 재주입
-            missing = not (
-                status.get("postal")
-                and status.get("base")
-                and status.get("detail")
+        except Exception:
+            return False
+
+    async def _click_address_search_button(self, page: Page) -> bool:
+        """주소찾기 버튼 자동 클릭. 셀렉터 → JS 텍스트 매칭 fallback."""
+        # 1) 셀렉터로 시도
+        try:
+            if await self.selectors.exists(
+                page, "order_page.zipcode_search_button", timeout_ms=800
+            ):
+                await self.selectors.click(
+                    page, "order_page.zipcode_search_button"
+                )
+                log.info("주소찾기 버튼 클릭 (셀렉터)")
+                return True
+        except Exception:
+            pass
+        # 2) JS 텍스트 매칭
+        try:
+            ok = await page.evaluate(
+                r"""() => {
+                  const cands = document.querySelectorAll(
+                    'a, button, input[type="button"]'
+                  );
+                  for (const el of cands) {
+                    const t = (el.innerText || el.value || '').trim();
+                    if (!/^주소\s*찾기$/.test(t)) continue;
+                    const cs = window.getComputedStyle(el);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                    try { el.click(); return true; } catch(e) {}
+                  }
+                  return false;
+                }"""
             )
-            if missing:
-                log.info(f"행{order.row}: 주소 일부 비어있음 → 재주입")
-                await self._js_inject_address_fields(page, order)
+            if ok:
+                log.info("주소찾기 버튼 클릭 (JS 텍스트)")
+                return True
+        except Exception as exc:
+            log.debug(f"주소찾기 버튼 JS 클릭 실패: {exc}")
+        return False
+
+    async def _auto_search_and_pick_address(
+        self, page: Page, query: str
+    ) -> bool:
+        """팝업에서 query 로 자동 검색 + 첫 결과 자동 클릭.
+
+        팝업이 inline layer 일 수도, iframe 일 수도 있다. 둘 다 처리.
+        """
+        if not query:
+            return False
+        # 검색 + 결과 선택을 한 번에 처리하는 JS
+        js = r"""
+async ([query]) => {
+  function visible(el) {
+    const cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  function setVal(el, v) {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, 'value'
+    )?.set;
+    if (setter) setter.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  }
+  // 검색창 찾기 (popup 안의 input)
+  const inputs = document.querySelectorAll(
+    'input[name="keyword"], input[placeholder*="도로명"], '
+    + 'input[placeholder*="주소"], input[placeholder*="검색"], '
+    + '.layer_addr input[type="text"], '
+    + '[class*="AddressSearch" i] input[type="text"]'
+  );
+  let searchInput = null;
+  for (const i of inputs) {
+    if (visible(i)) { searchInput = i; break; }
+  }
+  if (!searchInput) return 'no-input';
+
+  setVal(searchInput, query);
+  searchInput.focus();
+  // Enter 키 시뮬레이션 + 검색 버튼 클릭 둘 다 시도
+  searchInput.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+  searchInput.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', bubbles: true}));
+  searchInput.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
+  // 검색 버튼
+  const buttons = document.querySelectorAll('button, a, input[type="button"]');
+  for (const b of buttons) {
+    const t = (b.innerText || b.value || '').trim();
+    if (!/^검색$/.test(t)) continue;
+    if (!visible(b)) continue;
+    try { b.click(); break; } catch(e) {}
+  }
+  return 'searched';
+}
+"""
+        try:
+            r = await page.evaluate(js, [query])
+            log.debug(f"주소찾기 검색 시도: {r}")
+        except Exception as exc:
+            log.debug(f"주소찾기 검색 JS 실패: {exc}")
+            # iframe 안에 있을 가능성 → frame 별로 시도
+            for frame in page.frames:
+                if frame is page.main_frame:
+                    continue
+                try:
+                    await frame.evaluate(js, [query])
+                except Exception:
+                    continue
+
+        # 결과 로딩 대기
+        await asyncio.sleep(0.8)
+
+        # 첫 결과 선택 — 도로명 우선, 없으면 지번
+        pick_js = r"""
+() => {
+  function visible(el) {
+    const cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  // 결과 목록 — 클릭 가능한 항목 (a/li/button) 중 주소처럼 보이는 것
+  const cands = document.querySelectorAll(
+    '.layer_addr a, .layer_addr li, '
+    + '[class*="AddressSearch" i] a, [class*="AddressSearch" i] li, '
+    + '[class*="result" i] a, [class*="result" i] li, '
+    + 'ul[class*="addr" i] li, .search_result_box a, .search_result_box li, '
+    + '[role="listitem"]'
+  );
+  // 도로명 우선
+  for (const el of cands) {
+    if (!visible(el)) continue;
+    const t = (el.innerText || '').trim();
+    if (!t) continue;
+    if (/도로명/.test(t)) {
+      try { el.click(); return 'road:' + t.slice(0, 40); } catch(e) {}
+    }
+  }
+  // 지번/일반 결과
+  for (const el of cands) {
+    if (!visible(el)) continue;
+    const t = (el.innerText || '').trim();
+    if (!t) continue;
+    if (t.length < 6) continue;  // 너무 짧은 텍스트는 결과 아님
+    try { el.click(); return 'pick:' + t.slice(0, 40); } catch(e) {}
+  }
+  return null;
+}
+"""
+        try:
+            r2 = await page.evaluate(pick_js)
+            if r2:
+                log.info(f"주소찾기 결과 선택: {r2}")
+                return True
+        except Exception:
+            pass
+        # iframe fallback
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            try:
+                r2 = await frame.evaluate(pick_js)
+                if r2:
+                    log.info(f"주소찾기 결과 선택 (iframe): {r2}")
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _js_inject_address_fields(self, page: Page, order: Order) -> None:
         """우편번호 / 기본주소 / 상세주소 input 에 JS 로 직접 값 주입.

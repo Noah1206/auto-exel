@@ -116,3 +116,42 @@ class Order(BaseModel):
 
     def needs_price(self) -> bool:
         return self.total_price is None
+
+    def address_search_query(self) -> str:
+        """주소찾기 팝업에 입력할 검색어를 반환.
+
+        시/도 (서울특별시, 경기도, 인천광역시 등) 와 구/군 사이의 첫 토큰을 떼고
+        그 뒤부터의 주소를 반환. 예:
+          '경기도 김포시 통진읍 마송리 584-3 (통진읍...)' → '김포시 통진읍 마송리 584-3'
+          '서울특별시 강남구 선릉로130길 20 (삼성동)' → '강남구 선릉로130길 20'
+        괄호 안 동/리 보조 정보는 제거.
+        """
+        text = (self.address or "").strip()
+        if not text:
+            return ""
+        # 괄호 안 보조 텍스트 제거
+        import re as _re
+        text = _re.sub(r"\s*\(.*?\)\s*", " ", text).strip()
+        text = _re.sub(r"\s+", " ", text)
+        # 시/도 prefix 제거
+        SIDO_RE = _re.compile(
+            r"^(서울특별시|서울시|서울|"
+            r"부산광역시|부산시|부산|"
+            r"대구광역시|대구시|대구|"
+            r"인천광역시|인천시|인천|"
+            r"광주광역시|광주시|광주|"
+            r"대전광역시|대전시|대전|"
+            r"울산광역시|울산시|울산|"
+            r"세종특별자치시|세종시|세종|"
+            r"경기도|경기|"
+            r"강원특별자치도|강원도|강원|"
+            r"충청북도|충북|"
+            r"충청남도|충남|"
+            r"전북특별자치도|전라북도|전북|"
+            r"전라남도|전남|"
+            r"경상북도|경북|"
+            r"경상남도|경남|"
+            r"제주특별자치도|제주도|제주)\s+"
+        )
+        text = SIDO_RE.sub("", text).strip()
+        return text
