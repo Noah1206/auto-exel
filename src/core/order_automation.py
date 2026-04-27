@@ -373,9 +373,6 @@ class OrderAutomation:
                 await self._ensure_logged_in(page)
                 await self._detect_abnormal(page)
 
-                # 옵션 자동 선택 (색상/사이즈 등 옵션이 있으면 첫 번째 옵션 자동 선택)
-                await self._auto_select_options(page, order)
-
                 # 수량 선택 (수량 > 1 일 때만 필수, 1이어도 시도는 함)
                 self._emit(order, OrderState.SELECT_QUANTITY, f"수량 {order.quantity} 선택")
                 await self._select_quantity(page, order)
@@ -521,110 +518,6 @@ class OrderAutomation:
             raise CaptchaDetectedError(
                 "캡차가 감지되었습니다. 브라우저에서 직접 해결 후 재시도하세요."
             )
-
-    async def _auto_select_options(self, page: Page, order: Order) -> None:
-        """상품 옵션(색상/사이즈/모델 등)을 자동으로 선택.
-
-        11번가 상품은 옵션이 있으면 옵션 선택 전에는 수량 +/- 와 구매 버튼이
-        비활성 상태이거나 노출되지 않는다. 옵션을 자동 선택해서 다음 단계
-        (수량 선택, 구매하기) 가 가능하게 만든다.
-
-        규칙:
-          1) <select> 옵션은 첫 번째 유효 옵션(공백/'선택' 제외) 자동 선택
-          2) 라디오/버튼/li 형태의 옵션 박스는 첫 번째 클릭 가능 항목 클릭
-          3) URL 파라미터로 이미 옵션이 지정돼 있으면 그대로 두고 패스
-        """
-        try:
-            result = await page.evaluate(
-                r"""() => {
-                  const picked = [];
-
-                  // 1) <select> 옵션 — '선택해주세요' / '필수선택' 같은 placeholder 제외
-                  for (const sel of document.querySelectorAll('select')) {
-                    const s = window.getComputedStyle(sel);
-                    if (s.display === 'none' || s.visibility === 'hidden') continue;
-                    // 이미 유효한 값이 선택돼 있으면 패스
-                    const cur = sel.value;
-                    const curOpt = sel.options[sel.selectedIndex];
-                    const curText = curOpt ? (curOpt.text || '').trim() : '';
-                    const placeholderRe = /선택|필수|옵션을\s*선택|please|choose/i;
-                    if (cur && curText && !placeholderRe.test(curText)) continue;
-
-                    // 옵션 라벨이 옵션처럼 보이는 select 만 (수량/주소 select 제외)
-                    const hay = [
-                      sel.name||'', sel.id||'', sel.getAttribute('aria-label')||''
-                    ].join(' ').toLowerCase();
-                    if (/(qty|qty|수량|zip|post|우편|addr|주소|phone|tel|mbl|mobile)/i.test(hay)) continue;
-
-                    // 첫 번째 유효 옵션 선택
-                    for (let i = 0; i < sel.options.length; i++) {
-                      const o = sel.options[i];
-                      const t = (o.text || '').trim();
-                      if (!o.value || !t) continue;
-                      if (placeholderRe.test(t)) continue;
-                      const setter = Object.getOwnPropertyDescriptor(
-                        HTMLSelectElement.prototype, 'value'
-                      )?.set;
-                      if (setter) setter.call(sel, o.value); else sel.value = o.value;
-                      sel.dispatchEvent(new Event('change', {bubbles: true}));
-                      picked.push('select:' + (sel.name || sel.id) + '=' + t);
-                      break;
-                    }
-                  }
-
-                  // 2) 옵션 박스 — 색상/사이즈 등 클릭 가능한 li/button/label
-                  //    11번가 아마존관: '색상' 헤더 아래 동그란 색상 버튼들
-                  //    이미 선택된 항목(aria-pressed=true / .selected / .active)이 있으면 패스
-                  function pickFromContainer(container) {
-                    if (!container) return false;
-                    // 이미 선택된 게 있으면 패스
-                    const sel = container.querySelector(
-                      '[aria-pressed="true"], [aria-selected="true"], '
-                      + '.selected, .active, .on, [class*="selected" i], [class*="active" i]'
-                    );
-                    if (sel) return false;
-                    // 클릭 가능한 후보
-                    const candidates = container.querySelectorAll(
-                      'button, a[role="button"], li[role="option"], label, '
-                      + 'input[type="radio"], [role="radio"]'
-                    );
-                    for (const c of candidates) {
-                      if (c.disabled) continue;
-                      const cs = window.getComputedStyle(c);
-                      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                      const r = c.getBoundingClientRect();
-                      if (r.width < 8 || r.height < 8) continue;
-                      try { c.click(); } catch(e) { continue; }
-                      return true;
-                    }
-                    return false;
-                  }
-
-                  // 옵션 영역으로 보이는 컨테이너들
-                  const optBoxes = document.querySelectorAll(
-                    '[class*="option" i]:not([class*="add" i]):not([class*="more" i]), '
-                    + '[class*="Option" i], '
-                    + '[class*="color" i], [class*="Color" i], '
-                    + '[class*="size" i], [class*="Size" i], '
-                    + '.prd_options, .opt_list, .option_list'
-                  );
-                  for (const box of optBoxes) {
-                    if (pickFromContainer(box)) {
-                      picked.push('option-box:' + (box.className || box.id).slice(0, 40));
-                    }
-                  }
-
-                  return picked;
-                }"""
-            )
-            if result:
-                log.info(f"행{order.row}: 옵션 자동 선택: {result}")
-                # 옵션 선택 후 DOM 갱신 (수량 컨트롤이 활성화되도록)
-                await asyncio.sleep(0.4)
-            else:
-                log.debug(f"행{order.row}: 자동 선택할 옵션 없음")
-        except Exception as exc:
-            log.debug(f"행{order.row}: 옵션 자동 선택 실패: {exc}")
 
     async def _select_quantity(self, page: Page, order: Order) -> None:
         """수량을 order.quantity 만큼 맞춘다. 4가지 UI 패턴 지원:
