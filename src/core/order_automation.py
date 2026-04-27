@@ -1185,16 +1185,15 @@ class OrderAutomation:
             pass
 
     async def _is_address_popup_open(self, page: Page) -> bool:
-        """주소찾기 팝업(레이어/iframe) 이 열려있는지."""
+        """주소찾기 팝업이 열려있는지 (레이어/iframe/별도 popup 창 모두 체크)."""
+        # 1) 같은 페이지의 inline layer / iframe
         try:
-            return await page.evaluate(
+            inline = await page.evaluate(
                 r"""() => {
-                  // 1) iframe (zipcode 관련)
                   for (const f of document.querySelectorAll('iframe')) {
                     const n = (f.name || f.id || '').toLowerCase();
                     if (/zip|addr|post/i.test(n)) return true;
                   }
-                  // 2) 인라인 레이어
                   const layers = document.querySelectorAll(
                     '.layer_addr, [class*="AddressSearch" i], [class*="addr_search" i], '
                     + '[class*="addressLayer" i]'
@@ -1203,7 +1202,6 @@ class OrderAutomation:
                     const cs = window.getComputedStyle(l);
                     if (cs.display !== 'none' && cs.visibility !== 'hidden') return true;
                   }
-                  // 3) '주소 찾기' 헤더가 보이는 모달
                   const heads = document.querySelectorAll('h1, h2, h3, h4, .layer_title, .modal_title');
                   for (const h of heads) {
                     const t = (h.innerText || '').trim();
@@ -1215,8 +1213,37 @@ class OrderAutomation:
                   return false;
                 }"""
             )
+            if inline:
+                return True
         except Exception:
-            return False
+            pass
+        # 2) 별도 popup window — context 의 다른 page 중 주소찾기 URL
+        try:
+            ctx = page.context
+            for p in ctx.pages:
+                if p is page or p.is_closed():
+                    continue
+                url = p.url or ""
+                if "/addr/" in url or "searchAddr" in url or "zipcode" in url.lower():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    async def _find_address_popup_pages(self, page: Page) -> list[Page]:
+        """주소찾기 별도 창으로 떠 있는 page 들을 모두 반환."""
+        out: list[Page] = []
+        try:
+            ctx = page.context
+            for p in ctx.pages:
+                if p is page or p.is_closed():
+                    continue
+                url = p.url or ""
+                if "/addr/" in url or "searchAddr" in url or "zipcode" in url.lower():
+                    out.append(p)
+        except Exception:
+            pass
+        return out
 
     async def _click_address_search_button(self, page: Page) -> bool:
         """주소찾기 버튼 자동 클릭. 셀렉터 → JS 텍스트 매칭 fallback."""
@@ -1261,13 +1288,17 @@ class OrderAutomation:
     ) -> bool:
         """팝업에서 query 로 자동 검색 + 첫 결과 자동 클릭.
 
-        팝업이 inline layer 일 수도, iframe 일 수도 있다. 둘 다 처리.
+        팝업 형태:
+          A) inline layer / 같은 페이지 iframe
+          B) 별도 popup window (window.open) — 11번가 buy/addr/searchAddrV2.tmall
+        세 곳 다 시도.
         """
         if not query:
             return False
-        # 검색 + 결과 선택을 한 번에 처리하는 JS
-        js = r"""
-async ([query]) => {
+
+        # 검색 + 결과 선택을 한 번에 처리하는 JS (모든 컨텍스트 공통)
+        search_js = r"""
+([query]) => {
   function visible(el) {
     const cs = window.getComputedStyle(el);
     if (cs.display === 'none' || cs.visibility === 'hidden') return false;
@@ -1282,9 +1313,11 @@ async ([query]) => {
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
   }
-  // 검색창 찾기 (popup 안의 input)
+  // 검색창 후보 — 11번가 popup 의 #searchData 가 가장 우선
   const inputs = document.querySelectorAll(
-    'input[name="keyword"], input[placeholder*="도로명"], '
+    'input#searchData, input[name="searchData"], '
+    + 'input.input_search_box, '
+    + 'input[name="keyword"], input[placeholder*="도로명"], '
     + 'input[placeholder*="주소"], input[placeholder*="검색"], '
     + '.layer_addr input[type="text"], '
     + '[class*="AddressSearch" i] input[type="text"]'
@@ -1297,39 +1330,30 @@ async ([query]) => {
 
   setVal(searchInput, query);
   searchInput.focus();
-  // Enter 키 시뮬레이션 + 검색 버튼 클릭 둘 다 시도
-  searchInput.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
-  searchInput.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', bubbles: true}));
-  searchInput.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
-  // 검색 버튼
-  const buttons = document.querySelectorAll('button, a, input[type="button"]');
+  // Enter 키 시뮬레이션
+  searchInput.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
+  searchInput.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', keyCode: 13, bubbles: true}));
+  searchInput.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', keyCode: 13, bubbles: true}));
+  // 검색 버튼 클릭
+  const buttons = document.querySelectorAll(
+    'button.btn_search, button[onclick*="searchRoad"], '
+    + 'button, a, input[type="button"]'
+  );
   for (const b of buttons) {
     const t = (b.innerText || b.value || '').trim();
-    if (!/^검색$/.test(t)) continue;
+    const cls = (b.className || '').toLowerCase();
+    const onc = (b.getAttribute('onclick') || '').toLowerCase();
+    const isSearch = /^검색$/.test(t) || cls.includes('btn_search') || onc.includes('searchroad');
+    if (!isSearch) continue;
     if (!visible(b)) continue;
     try { b.click(); break; } catch(e) {}
   }
+  // 11번가 popup: searchRoad() 함수가 전역에 있을 수 있음
+  try { if (typeof searchRoad === 'function') searchRoad(); } catch(e) {}
   return 'searched';
 }
 """
-        try:
-            r = await page.evaluate(js, [query])
-            log.debug(f"주소찾기 검색 시도: {r}")
-        except Exception as exc:
-            log.debug(f"주소찾기 검색 JS 실패: {exc}")
-            # iframe 안에 있을 가능성 → frame 별로 시도
-            for frame in page.frames:
-                if frame is page.main_frame:
-                    continue
-                try:
-                    await frame.evaluate(js, [query])
-                except Exception:
-                    continue
 
-        # 결과 로딩 대기
-        await asyncio.sleep(0.8)
-
-        # 첫 결과 선택 — 도로명 우선, 없으면 지번
         pick_js = r"""
 () => {
   function visible(el) {
@@ -1338,12 +1362,14 @@ async ([query]) => {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   }
-  // 결과 목록 — 클릭 가능한 항목 (a/li/button) 중 주소처럼 보이는 것
+  // 결과 목록
   const cands = document.querySelectorAll(
-    '.layer_addr a, .layer_addr li, '
+    '.search_result_box a, .search_result_box li, '
+    + '#searchResultBox a, #searchResultBox li, '
+    + '.layer_addr a, .layer_addr li, '
     + '[class*="AddressSearch" i] a, [class*="AddressSearch" i] li, '
     + '[class*="result" i] a, [class*="result" i] li, '
-    + 'ul[class*="addr" i] li, .search_result_box a, .search_result_box li, '
+    + 'ul[class*="addr" i] li, '
     + '[role="listitem"]'
   );
   // 도로명 우선
@@ -1355,35 +1381,63 @@ async ([query]) => {
       try { el.click(); return 'road:' + t.slice(0, 40); } catch(e) {}
     }
   }
-  // 지번/일반 결과
   for (const el of cands) {
     if (!visible(el)) continue;
     const t = (el.innerText || '').trim();
-    if (!t) continue;
-    if (t.length < 6) continue;  // 너무 짧은 텍스트는 결과 아님
+    if (!t || t.length < 6) continue;
     try { el.click(); return 'pick:' + t.slice(0, 40); } catch(e) {}
   }
   return null;
 }
 """
-        try:
-            r2 = await page.evaluate(pick_js)
-            if r2:
-                log.info(f"주소찾기 결과 선택: {r2}")
+
+        async def try_in_context(target) -> bool:
+            """target 은 Page 또는 Frame. 검색 + 결과 선택 시도."""
+            try:
+                r = await target.evaluate(search_js, [query])
+                log.debug(f"주소찾기 검색 시도 ({getattr(target, 'url', lambda: '')()}): {r}")
+                if r == 'no-input':
+                    return False
+            except Exception as exc:
+                log.debug(f"주소찾기 검색 JS 실패: {exc}")
+                return False
+            # 결과 로딩 대기
+            await asyncio.sleep(1.0)
+            try:
+                r2 = await target.evaluate(pick_js)
+                if r2:
+                    log.info(f"주소찾기 결과 선택: {r2}")
+                    return True
+            except Exception:
+                return False
+            return False
+
+        # 1) 별도 popup window 우선 (가장 흔한 케이스)
+        for popup_page in await self._find_address_popup_pages(page):
+            try:
+                # popup 이 완전 로드되기까지 대기
+                await popup_page.wait_for_load_state(
+                    "domcontentloaded", timeout=3000
+                )
+            except Exception:
+                pass
+            if await try_in_context(popup_page):
                 return True
-        except Exception:
-            pass
-        # iframe fallback
+            # popup main_frame 이 안 됐으면 그 안의 iframe 시도
+            for frame in popup_page.frames:
+                if frame is popup_page.main_frame:
+                    continue
+                if await try_in_context(frame):
+                    return True
+
+        # 2) 같은 page 의 main + iframe
+        if await try_in_context(page):
+            return True
         for frame in page.frames:
             if frame is page.main_frame:
                 continue
-            try:
-                r2 = await frame.evaluate(pick_js)
-                if r2:
-                    log.info(f"주소찾기 결과 선택 (iframe): {r2}")
-                    return True
-            except Exception:
-                continue
+            if await try_in_context(frame):
+                return True
         return False
 
     async def _js_inject_address_fields(self, page: Page, order: Order) -> None:
