@@ -131,11 +131,20 @@ class StatusDelegate(QStyledItemDelegate):
         style = _STATUS_STYLE.get(status, _STATUS_STYLE["pending"])
         bg_hex, fg_hex, label, icon_char = style
 
-        # 배경(선택/행 배경)은 기본 delegate 가 그려주도록 먼저 호출 — 단 텍스트는 안 그리게
-        # QStyledItemDelegate 기본 동작은 텍스트까지 그리므로 수동 배경만 그린다.
+        # 사용자 트리거 대기 중이면 알약 대신 액션 버튼을 셀 중앙에 단독 표시.
+        row_key = index.row()
+        awaiting_fill = bool(
+            self._is_awaiting_fill and self._is_awaiting_fill(index)
+        )
+        awaiting_next = (
+            not awaiting_fill
+            and self._is_awaiting_next is not None
+            and self._is_awaiting_next(index)
+        )
+
         painter.save()
         try:
-            # 선택 하이라이트 / 현재 행 하이라이트 배경
+            # 선택 하이라이트 / 행 배경 먼저 그림
             if option.state & QStyle.State_Selected:
                 painter.fillRect(option.rect, option.palette.highlight())
             else:
@@ -145,9 +154,49 @@ class StatusDelegate(QStyledItemDelegate):
 
             painter.setRenderHint(QPainter.Antialiasing, True)
 
-            # pill 배지 크기/위치 계산 (셀 중앙)
-            # option.font 가 pixel 단위 폰트면 pointSizeF() 가 -1.0 을 반환 →
-            # setPointSizeF(-1) 이 경고를 뿜으므로 유효할 때만 복사한다.
+            # ── awaiting 상태: 액션 버튼만 셀 중앙에 단독 표시
+            if awaiting_fill or awaiting_next:
+                if awaiting_fill:
+                    btn_label = "기입"
+                    btn_color = QColor("#10B981")
+                    target_rect_dict = self._fill_btn_rects
+                    self._next_btn_rects.pop(row_key, None)
+                else:
+                    btn_label = "다음으로"
+                    btn_color = QColor("#2563EB")
+                    target_rect_dict = self._next_btn_rects
+                    self._fill_btn_rects.pop(row_key, None)
+
+                btn_font = QFont(option.font)
+                btn_font.setWeight(QFont.DemiBold)
+                painter.setFont(btn_font)
+                bfm = painter.fontMetrics()
+                btn_text_w = bfm.horizontalAdvance(btn_label)
+                btn_h = max(22, bfm.height() + 6)
+                btn_w = btn_text_w + 22
+                cx = option.rect.center().x()
+                cy = option.rect.center().y()
+                btn_rect = QRectF(
+                    cx - btn_w / 2, cy - btn_h / 2, btn_w, btn_h
+                )
+                # 셀 우측 넘으면 안쪽으로 당기기
+                if btn_rect.right() > option.rect.right() - 4:
+                    btn_rect.moveRight(option.rect.right() - 4)
+                if btn_rect.left() < option.rect.left() + 4:
+                    btn_rect.moveLeft(option.rect.left() + 4)
+                btn_path = QPainterPath()
+                radius = btn_h / 2
+                btn_path.addRoundedRect(btn_rect, radius, radius)
+                painter.fillPath(btn_path, btn_color)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(btn_rect, Qt.AlignCenter, btn_label)
+                target_rect_dict[row_key] = btn_rect.toRect()
+                return
+
+            # ── 일반 상태: 알약 배지 표시 (기존 디자인)
+            self._next_btn_rects.pop(row_key, None)
+            self._fill_btn_rects.pop(row_key, None)
+
             font = QFont(option.font)
             font.setWeight(QFont.DemiBold)
             painter.setFont(font)
@@ -155,7 +204,7 @@ class StatusDelegate(QStyledItemDelegate):
 
             text_w = fm.horizontalAdvance(label)
             pill_h = max(22, fm.height() + 6)
-            icon_slot = 16  # 아이콘/스피너 너비
+            icon_slot = 16
             inner_pad_h = 10
             inner_gap = 6
             pill_w = inner_pad_h + icon_slot + inner_gap + text_w + inner_pad_h
@@ -163,17 +212,12 @@ class StatusDelegate(QStyledItemDelegate):
             cx = option.rect.center().x()
             cy = option.rect.center().y()
             pill_rect = QRectF(
-                cx - pill_w / 2,
-                cy - pill_h / 2,
-                pill_w,
-                pill_h,
+                cx - pill_w / 2, cy - pill_h / 2, pill_w, pill_h
             )
 
-            # pill 배경
             path = QPainterPath()
             path.addRoundedRect(pill_rect, pill_h / 2, pill_h / 2)
             painter.fillPath(path, QColor(bg_hex))
-            # 특정 상태는 흰 배경이므로 얇은 검정 테두리 추가
             if status in _STATUS_OUTLINE:
                 border_pen = QPen(QColor("#111827"), 1.0)
                 painter.setPen(border_pen)
@@ -182,7 +226,6 @@ class StatusDelegate(QStyledItemDelegate):
 
             fg = QColor(fg_hex)
 
-            # 아이콘/스피너 영역
             icon_rect = QRectF(
                 pill_rect.left() + inner_pad_h,
                 pill_rect.top() + (pill_h - icon_slot) / 2,
@@ -193,19 +236,14 @@ class StatusDelegate(QStyledItemDelegate):
             if status == "in_progress":
                 self._paint_spinner(painter, icon_rect, fg)
             else:
-                # 심플한 원 안에 글리프 (completed 는 체크, 나머지는 라벨 문자)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(fg)
-                # 작은 도넛 대신 배경색 위에 글리프만 그리자 (깔끔)
                 painter.setBrush(Qt.NoBrush)
                 pen = QPen(fg, 1.5)
                 painter.setPen(pen)
-                # 동그라미 테두리
                 painter.drawEllipse(icon_rect.adjusted(1.5, 1.5, -1.5, -1.5))
-                # 글리프 (체크, ×, ⏸ 등)
                 if icon_char:
                     glyph_font = QFont(option.font)
-                    # pointSizeF() 가 -1(픽셀 폰트)이면 그대로 두고, 양수일 때만 줄이기
                     base_pt = font.pointSizeF()
                     if base_pt > 0:
                         glyph_font.setPointSizeF(max(8.0, base_pt - 1))
@@ -215,7 +253,6 @@ class StatusDelegate(QStyledItemDelegate):
                     painter.drawText(icon_rect, Qt.AlignCenter, icon_char)
                     painter.setFont(font)
 
-            # 라벨
             painter.setPen(fg)
             text_rect = QRectF(
                 icon_rect.right() + inner_gap,
@@ -224,51 +261,6 @@ class StatusDelegate(QStyledItemDelegate):
                 pill_rect.height(),
             )
             painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
-
-            # 인라인 버튼 — 같은 위치에 상황별로 하나만 그린다.
-            # 깔끔한 톤: 작은 폰트, 무이모지, 알약과 같은 높이.
-            row_key = index.row()
-            btn_label = None
-            btn_color = None
-            target_rect_dict = None
-            if self._is_awaiting_fill and self._is_awaiting_fill(index):
-                btn_label = "기입"
-                btn_color = QColor("#10B981")  # 초록
-                target_rect_dict = self._fill_btn_rects
-                self._next_btn_rects.pop(row_key, None)
-            elif self._is_awaiting_next and self._is_awaiting_next(index):
-                btn_label = "다음으로"
-                btn_color = QColor("#2563EB")  # 파랑
-                target_rect_dict = self._next_btn_rects
-                self._fill_btn_rects.pop(row_key, None)
-            else:
-                self._next_btn_rects.pop(row_key, None)
-                self._fill_btn_rects.pop(row_key, None)
-
-            if btn_label is not None and btn_color is not None and target_rect_dict is not None:
-                # 알약과 정확히 같은 높이로 맞추고, 폰트는 한 단계 작게.
-                btn_font = QFont(option.font)
-                btn_font.setWeight(QFont.DemiBold)
-                base_pt = btn_font.pointSizeF()
-                if base_pt > 0:
-                    btn_font.setPointSizeF(max(8.0, base_pt - 1))
-                painter.setFont(btn_font)
-                bfm = painter.fontMetrics()
-                btn_text_w = bfm.horizontalAdvance(btn_label)
-                btn_h = pill_h - 4  # 알약보다 약간 작게 (시각적 위계)
-                btn_w = btn_text_w + 16
-                # pill 우측 6px 갭, 셀 우측 넘으면 클램프
-                btn_x = pill_rect.right() + 6
-                if btn_x + btn_w > option.rect.right() - 4:
-                    btn_x = option.rect.right() - 4 - btn_w
-                btn_rect = QRectF(btn_x, cy - btn_h / 2, btn_w, btn_h)
-                btn_path = QPainterPath()
-                radius = btn_h / 2
-                btn_path.addRoundedRect(btn_rect, radius, radius)
-                painter.fillPath(btn_path, btn_color)
-                painter.setPen(QColor("#FFFFFF"))
-                painter.drawText(btn_rect, Qt.AlignCenter, btn_label)
-                target_rect_dict[row_key] = btn_rect.toRect()
         finally:
             painter.restore()
 
