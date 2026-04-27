@@ -364,22 +364,22 @@ def validate_quantity(raw) -> int:
 
 
 def clean_recipient_name(raw) -> str:
-    """수취인(한글 이름) 정규화.
+    """수취인 이름 정규화.
 
     처리:
       - 보이지 않는 공백/전각 공백 제거
       - 앞뒤 공백 제거, 내부 연속 공백 단일화
-      - 빈 값 거부, 30자 초과 거부
+      - 빈 값 거부, 80자 초과 거부 (스리랑카/인도식 긴 이름 허용)
     검증 완화:
-      - 한자 이름(예: 金哲洙)이나 외국인 이름(예: Nguyen Van A) 허용
+      - 한자 이름(예: 金哲洙)이나 외국인 이름(예: Dissanayaka mudiyanselage ...) 허용
       - 숫자/기호가 섞여 있어도 허용 — 11번가 주문서 자체는 폭넓게 받음
     """
     text = _clean_text(raw)
     if not text:
         raise ValueError("수취인 이름이 비어있습니다")
     text = re.sub(r"\s+", " ", text)
-    if len(text) > 30:
-        raise ValueError(f"수취인 이름이 너무 깁니다 (30자 초과): {text!r}")
+    if len(text) > 80:
+        raise ValueError(f"수취인 이름이 너무 깁니다 (80자 초과): {text!r}")
     return text
 
 

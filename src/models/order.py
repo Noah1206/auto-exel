@@ -41,7 +41,7 @@ class Order(BaseModel):
 
     # 입력 필드 (8개)
     product_url: str = Field(description="구매처 URL")
-    name: str = Field(min_length=1, max_length=30, description="수취인")
+    name: str = Field(min_length=1, max_length=80, description="수취인")
     phone: str = Field(description="수취인번호")
     customs_id: str = Field(description="통관번호")
     postal_code: str = Field(description="우편번호")
