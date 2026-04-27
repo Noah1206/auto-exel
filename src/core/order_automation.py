@@ -177,31 +177,31 @@ class OrderAutomation:
     async def _await_user_fill(
         self, row: int, page: Page | None = None, timeout_sec: int = 1800
     ) -> None:
-        """다음 두 트리거 중 먼저 일어나는 쪽까지 대기:
-          1) 사용자가 메인 프로그램의 '기입' 버튼 클릭 → signal_fill(row)
-          2) 자동 감지: Chrome 에서 '구매하기' 누르면 주문서 페이지(/pay/...) 가 뜸
-             → 사용자가 따로 '기입' 안 눌러도 자동 진행
+        """다음 트리거 중 먼저 일어나는 쪽까지 대기:
+          1) '기입' 버튼 클릭 → signal_fill(row)
+          2) 자동 감지: 주문서 페이지(/pay/...) 가 뜸 → 자동 진행
+          3) 페이지(또는 모든 컨텍스트 페이지) 닫힘 → UserInterventionRequired 예외
 
-        page 가 주어지면 그 page 의 context 의 모든 탭을 1초 간격으로 폴링해
-        주문서 URL 이 보이면 즉시 트리거 발동.
+        반환: 1/2 일 때 정상 return.
+        예외: 3 일 때 UserInterventionRequired (호출자가 행 종료 처리).
         """
         ev = asyncio.Event()
         self._fill_events[row] = ev
 
-        async def _wait_user() -> None:
+        async def _wait_user() -> str:
             await ev.wait()
+            return "user"
 
-        async def _wait_order_page() -> None:
+        async def _wait_order_page() -> str:
             if page is None:
-                # 폴링할 page 가 없으면 그냥 user 만 대기
                 await asyncio.Event().wait()
-                return
+                return "order"
             try:
                 ctx = page.context
             except Exception:
                 await asyncio.Event().wait()
-                return
-            poll = 1.0
+                return "order"
+            poll = 0.7
             while True:
                 try:
                     for p in ctx.pages:
@@ -216,24 +216,60 @@ class OrderAutomation:
                             log.info(
                                 f"행{row}: 주문서 페이지 자동 감지 → '기입' 자동 트리거 ({url[:80]})"
                             )
-                            return
+                            return "order"
+                except Exception:
+                    pass
+                await asyncio.sleep(poll)
+
+        async def _wait_pages_closed() -> str:
+            """모든 페이지가 닫힐 때까지 폴링. 닫히면 'closed' 반환."""
+            if page is None:
+                await asyncio.Event().wait()
+                return "closed"
+            try:
+                ctx = page.context
+            except Exception:
+                await asyncio.Event().wait()
+                return "closed"
+            poll = 0.5
+            while True:
+                try:
+                    alive = any(not p.is_closed() for p in ctx.pages)
+                    if not alive:
+                        log.info(
+                            f"행{row}: 모든 페이지 닫힘 감지 → 행 종료"
+                        )
+                        return "closed"
                 except Exception:
                     pass
                 await asyncio.sleep(poll)
 
         try:
-            user_task = asyncio.create_task(_wait_user())
-            page_task = asyncio.create_task(_wait_order_page())
+            tasks = {
+                asyncio.create_task(_wait_user()),
+                asyncio.create_task(_wait_order_page()),
+                asyncio.create_task(_wait_pages_closed()),
+            }
             done, pending = await asyncio.wait(
-                {user_task, page_task},
+                tasks,
                 timeout=timeout_sec,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
                 t.cancel()
             if not done:
-                # timeout
                 raise asyncio.TimeoutError("기입 대기 타임아웃")
+            # 어떤 trigger 였는지 확인
+            for t in done:
+                try:
+                    result = t.result()
+                except Exception:
+                    continue
+                if result == "closed":
+                    raise UserInterventionRequired(
+                        "사용자가 페이지를 닫아 행을 종료했습니다.",
+                        checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                    )
         finally:
             self._fill_events.pop(row, None)
 
