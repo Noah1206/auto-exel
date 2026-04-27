@@ -226,16 +226,26 @@ order_page:
     - 'a:has-text("개인통관고유부호 입력"):not([target="_blank"]):not([href*="customs.go.kr"])'
   english_name:
     # "영문이름 입력 (예:HONG GILDONG)"
+    - 'input[name="ordEngNm"]'        # 11번가 아마존관 (2026-04 확인)
+    - 'input#ordEngNm'
     - 'input[name="engNm"]'
     - 'input#engNm'
+    - 'input[name="rcvrEngNm"]'
     - 'input[placeholder*="영문이름"]'
     - 'input[placeholder*="HONG GILDONG"]'
     - 'input[placeholder*="영문"]'
     - 'input[name*="eng" i][name*="Nm" i]'
+    - 'input[id*="eng" i][id*="Nm" i]'
   english_first_name:
     - 'input[name="engFirstNm"]'
+    - 'input[name="ordEngFirstNm"]'
+    - 'input[placeholder*="이름(영문)"]'
+    - 'input[placeholder*="First"]'
   english_last_name:
     - 'input[name="engLastNm"]'
+    - 'input[name="ordEngLastNm"]'
+    - 'input[placeholder*="성(영문)"]'
+    - 'input[placeholder*="Last"]'
   payment_card:
     - 'input[type="radio"][value="card"]'
     - 'label:has-text("신용카드")'

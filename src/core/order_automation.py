@@ -929,24 +929,117 @@ class OrderAutomation:
         # 개인통관고유부호 입력 — 실패하면 주문을 실패시킨다 (무조건 들어가야 함)
         await self._fill_customs_id_or_fail(page, order)
 
-        # 영문 이름
-        if await self.selectors.exists(page, "order_page.english_name", timeout_ms=800):
-            await self._force_fill(
-                page, "order_page.english_name", order.english_name, delay
-            )
-        else:
-            parts = order.english_name.split()
-            if len(parts) >= 2:
-                first = parts[0]
-                last = " ".join(parts[1:])
+        # 영문 이름 — 통합 필드 우선, 없으면 first/last 분리 필드, 그것도 없으면
+        # 잠깐 대기 후 재시도 (통관번호 조회 후에 노출되는 경우 대비).
+        eng_name = (order.english_name or "").strip()
+        if eng_name:
+            await self._fill_english_name(page, eng_name, delay)
+
+    async def _fill_english_name(
+        self, page: Page, eng_name: str, delay: int
+    ) -> None:
+        """영문이름 입력 — 통합/분리/재시도/JS 강제 순으로 견고하게 시도.
+
+        11번가는 사용자에 따라 다음 중 하나의 형태로 영문이름을 받는다:
+          - 단일 input (예: ordEngNm) — 'HONG GILDONG' 풀네임
+          - first/last 분리 input — first='GILDONG', last='HONG'
+          - 통관번호 조회 직후에야 영문 input 이 노출되는 경우
+        """
+        parts = eng_name.split()
+        first = parts[0] if parts else ""
+        last = " ".join(parts[1:]) if len(parts) >= 2 else ""
+
+        async def _try_once() -> bool:
+            # 1) 통합 필드 우선
+            if await self.selectors.exists(
+                page, "order_page.english_name", timeout_ms=400
+            ):
+                if await self._force_fill(
+                    page, "order_page.english_name", eng_name, delay
+                ):
+                    log.info(f"영문이름 통합 필드 입력 성공: {eng_name!r}")
+                    return True
+            # 2) first/last 분리 필드
+            if first and last:
                 ok1 = await self._force_fill(
                     page, "order_page.english_first_name", first, delay
                 )
                 ok2 = await self._force_fill(
                     page, "order_page.english_last_name", last, delay
                 )
-                if not (ok1 and ok2):
-                    log.warning("영문 이름 입력 필드를 찾지 못했습니다 (건너뜀)")
+                if ok1 and ok2:
+                    log.info(
+                        f"영문이름 분리 필드 입력 성공: first={first!r} last={last!r}"
+                    )
+                    return True
+            return False
+
+        # 1차 시도
+        if await _try_once():
+            return
+
+        # 통관번호 조회 결과 등 비동기 갱신 대기 후 재시도 (최대 3회)
+        for attempt in range(3):
+            await asyncio.sleep(0.6)
+            if await _try_once():
+                return
+            log.debug(f"영문이름 재시도 {attempt + 1}/3")
+
+        # 마지막 수단: JS 로 페이지 전체 input 을 훑어 영문이름 후보를 찾아 직접 주입
+        try:
+            injected = await page.evaluate(
+                r"""
+([fullName, firstName, lastName]) => {
+  function setVal(el, v) {
+    try { el.removeAttribute('readonly'); } catch(e){}
+    try { el.removeAttribute('disabled'); } catch(e){}
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, 'value'
+    )?.set;
+    if (setter) setter.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  }
+  function hayOf(el) {
+    return [el.name||'', el.id||'', el.placeholder||'',
+            el.getAttribute('aria-label')||''].join(' ').toLowerCase();
+  }
+  const touched = [];
+  for (const el of document.querySelectorAll('input')) {
+    const t = (el.type||'').toLowerCase();
+    if (['checkbox','radio','submit','button','file','image','hidden'].includes(t)) continue;
+    const hay = hayOf(el);
+    if (/(eng.*nm|eng.*name|영문이름|hong\s*gildong|영문)/i.test(hay)) {
+      // first / last 분리 hint 가 있으면 그쪽 사용
+      if (firstName && /first|이름.*영문|^.*first.*$/i.test(hay)) {
+        setVal(el, firstName);
+        touched.push('first:' + (el.name || el.id));
+        continue;
+      }
+      if (lastName && /last|성.*영문|^.*last.*$/i.test(hay)) {
+        setVal(el, lastName);
+        touched.push('last:' + (el.name || el.id));
+        continue;
+      }
+      setVal(el, fullName);
+      touched.push('full:' + (el.name || el.id));
+    }
+  }
+  return touched;
+}
+""",
+                [eng_name, first, last],
+            )
+            if injected:
+                log.info(f"영문이름 JS 강제 주입 성공: {injected}")
+                return
+        except Exception as exc:
+            log.debug(f"영문이름 JS 강제 주입 실패: {exc}")
+
+        log.warning(
+            f"영문이름 입력 실패 (필드 못 찾음): {eng_name!r} — "
+            "사용자가 직접 입력해야 합니다"
+        )
 
     async def _fill_postal_and_address(self, page: Page, order: Order) -> None:
         """우편번호/주소 자동 입력 (전 과정 무인 자동화).
