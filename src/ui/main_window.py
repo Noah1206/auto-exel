@@ -413,6 +413,13 @@ class MainWindow(QMainWindow):
         self.action_scrape = QAction("가격 조회", self)
         self.action_scrape.triggered.connect(self._on_scrape_prices)
 
+        # 기입 — 선택한 행에 대해 '기입' 신호 전송 (사용자가 원할 때 강제 트리거)
+        self.action_fill = QAction("기입", self)
+        self.action_fill.setToolTip(
+            "선택한 행이 '기입 대기' 중이면 주문서 자동 입력을 시작합니다"
+        )
+        self.action_fill.triggered.connect(self._on_fill_clicked_toolbar)
+
         # 주문하기 / 중단하기 토글 — 한 버튼이 상태에 따라 역할 전환
         self.action_start_orders = QAction("주문하기", self)
         self.action_start_orders.setShortcut(QKeySequence("Ctrl+R"))
@@ -447,6 +454,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.action_save_original)  # 원본에 저장
         tb.addAction(self.action_scrape)         # 가격 조회
+        tb.addAction(self.action_fill)           # 기입 (선택 행에 신호 전송)
 
         # 초기: 엑셀 미로드 상태이므로 툴바 숨김
         tb.setVisible(False)
@@ -856,6 +864,47 @@ class MainWindow(QMainWindow):
             self.action_toggle_chrome.setText("크롬 창 보기")
             self._run_async(self.browser.hide_window())
             self.statusBar().showMessage("크롬 창 숨김 (백그라운드 실행 중)", 3000)
+
+    def _on_fill_clicked_toolbar(self) -> None:
+        """툴바 '기입' 버튼 — 선택한 행에 대해 기입 신호 전송.
+
+        - 선택된 행이 1건이면 그 행에 신호.
+        - 여러 건 선택했어도 '기입 대기 중' 인 행에만 신호 (보통 1건).
+        - 선택이 없으면 기입 대기 중인 행을 자동으로 찾아 신호.
+        """
+        if self.automation is None:
+            self.statusBar().showMessage(
+                "주문이 시작된 행이 없습니다 — 먼저 행을 더블클릭해 주문을 시작하세요",
+                4000,
+            )
+            return
+
+        # 1) 선택된 행 중 기입 대기 중인 것 찾기
+        selected = self._selected_orders()
+        targets = [
+            o for o in selected
+            if self.automation.is_awaiting_fill(o.row)
+        ]
+        # 2) 선택 없거나 기입 대기 행이 없으면 전체에서 자동 탐색
+        if not targets:
+            for r in self.model.all_rows():
+                if isinstance(r, Order) and self.automation.is_awaiting_fill(r.row):
+                    targets.append(r)
+
+        if not targets:
+            self.statusBar().showMessage(
+                "기입 대기 중인 행이 없습니다 (수량 변경 후 자동으로 대기 상태가 됩니다)",
+                4000,
+            )
+            return
+
+        for o in targets:
+            self.automation.signal_fill(o.row)
+        rows_str = ", ".join(str(o.row) for o in targets)
+        self.statusBar().showMessage(
+            f"행 {rows_str}: '기입' 신호 전송 — 주문서 자동 입력 중...", 4000
+        )
+        log.info(f"툴바 기입 클릭 → 행 {rows_str} 에 신호 전송")
 
     def _on_scrape_prices(self) -> None:
         if self.excel_mgr is None or not self.model.all_rows():
