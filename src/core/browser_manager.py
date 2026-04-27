@@ -42,7 +42,15 @@ class BrowserManager:
         # 샵백 확장프로그램은 헤드리스 모드에선 로드가 안 되므로 headful 유지가 필수.
         # 포커스는 어떤 경우에도 Chrome 으로 자동 이동하지 않는다.
         # 사용자가 UI 버튼으로 '크롬 창 보기'를 누르면 창 위치만 이동(포커스 X).
+        #
+        # Windows 한정: --window-position=-3000,0 으로 launch 한 뒤 PowerShell
+        # MoveWindow 로 다시 안으로 못 끌어오는 사례 (멀티모니터/PowerShell 차단/
+        # MainWindowHandle 미할당 등) 가 잦아서, Windows 에서는 hide_window 를
+        # 무시하고 처음부터 화면 안 좌표(0,0) 에 띄운다. 사용자 포커스 보호는
+        # macOS 보다 덜 민감하고, 보이는 게 안 보이는 것보다 낫다.
         hidden = getattr(self.config, "hide_window", True)
+        if sys.platform == "win32":
+            hidden = False
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
@@ -50,6 +58,12 @@ class BrowserManager:
         if hidden:
             launch_args += [
                 "--window-position=-3000,0",
+                f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
+            ]
+        elif sys.platform == "win32":
+            # 화면 안에 명확히 보이도록 좌표 + 크기 명시
+            launch_args += [
+                "--window-position=0,0",
                 f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
             ]
         else:
@@ -126,7 +140,8 @@ class BrowserManager:
         # macOS: 새 탭이 생기면 Chrome 앱이 frontmost 가 되며 사용자 OS 포커스를
         # 빼앗는다. hide_window 모드라면 즉시 창을 화면 밖으로 다시 밀어내
         # 사용자가 작업 중이던 앱의 포커스를 보존한다.
-        if getattr(self.config, "hide_window", True):
+        # Windows 는 hide_window 무시 (창이 화면 안에 그대로 보이는 게 더 중요).
+        if sys.platform != "win32" and getattr(self.config, "hide_window", True):
             await self.hide_window()
         return page
 
