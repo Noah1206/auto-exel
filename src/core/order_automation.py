@@ -932,65 +932,35 @@ class OrderAutomation:
         return False
 
     async def _switch_to_direct_input(self, page: Page) -> None:
-        """배송지 입력 모드를 '직접입력' 으로 전환.
+        """배송지 입력 모드를 '직접입력' 으로 즉시 전환.
 
         11번가 해외직구 주문 페이지는 기본배송지/최근배송지/직접입력 3가지
         라디오가 있고 기본값이 '기본배송지' 여서 받는사람/주소 input 이
         DOM 에 렌더링되지 않는다. 직접입력 라디오를 선택하면 입력 폼이 나타난다.
 
-        이미 직접입력이 선택돼 있거나 해당 UI 자체가 없는 페이지면 그냥 넘어간다.
+        속도 최적화: JS 로 즉시 전환 (셀렉터 timeout 대기 없이).
+        실패 시 셀렉터 fallback (총 0.6초 안에 끝남).
         """
-        # 1) 라디오 직접 클릭 시도
-        try:
-            loc = await self.selectors.find(
-                page, "order_page.direct_input_radio", timeout_ms=2000
-            )
-            try:
-                checked = await loc.is_checked()
-            except Exception:
-                checked = False
-            if not checked:
-                await loc.check()
-                await asyncio.sleep(0.1)
-                log.info("배송지 모드 → 직접입력 전환 (라디오 체크)")
-            return
-        except ElementNotFoundError:
-            pass
-        except Exception as exc:
-            log.debug(f"직접입력 라디오 체크 실패: {exc}")
-
-        # 2) 라벨/버튼 클릭
-        try:
-            await self.selectors.click(
-                page, "order_page.direct_input_label", timeout_ms=800
-            )
-            await asyncio.sleep(0.1)
-            log.info("배송지 모드 → 직접입력 전환 (라벨 클릭)")
-            return
-        except ElementNotFoundError:
-            pass
-        except Exception as exc:
-            log.debug(f"직접입력 라벨 클릭 실패: {exc}")
-
-        # 3) JS fallback — "직접입력" 텍스트 근처의 라디오/label 직접 클릭
-        #    ⚠ <a href> 링크는 **절대 클릭하지 않는다**. 11번가 주문서에는
-        #    "새로운 배송지 등록" 같은 텍스트를 가진 마이페이지 링크(OrderList 등)가
-        #    있어서 잘못 클릭하면 주문서에서 이탈해 버린다.
+        # 1) JS 로 즉시 전환 — 가장 빠르고 a 링크 회피도 자체 처리
         js = r"""
 () => {
+  // 이미 '직접입력' 라디오가 체크돼 있는지 확인
+  for (const r of document.querySelectorAll('input[type="radio"]')) {
+    if (!r.checked) continue;
+    const lbl = r.closest('label')?.innerText || '';
+    if (/직접\s*입력|신규\s*배송지|새로운\s*배송지/.test(lbl)) return 'already-checked';
+  }
+  // 아니면 '직접입력' 텍스트 라벨/라디오/버튼 클릭
   const all = document.querySelectorAll('label, button, input[type="radio"]');
   for (const el of all) {
-    // 혹시라도 a 태그 또는 href 가진 요소면 스킵
     if (el.tagName === 'A') continue;
     if (el.closest && el.closest('a[href]')) continue;
     const txt = (el.innerText || el.textContent || el.value || '').trim();
     if (!/직접\s*입력|신규\s*배송지|새로운\s*배송지/.test(txt)) continue;
-    // 숨겨진 것 제외
     const s = window.getComputedStyle(el);
     if (s.display === 'none' || s.visibility === 'hidden') continue;
     try {
       el.click();
-      // label 이면 내부 radio 도 체크 시도
       if (el.tagName === 'LABEL') {
         const r = el.querySelector('input[type="radio"]');
         if (r) { r.checked = true; r.dispatchEvent(new Event('change', {bubbles: true})); }
@@ -998,7 +968,7 @@ class OrderAutomation:
         el.checked = true;
         el.dispatchEvent(new Event('change', {bubbles: true}));
       }
-      return txt;
+      return 'clicked:' + txt.slice(0, 20);
     } catch(e) {}
   }
   return null;
@@ -1007,11 +977,36 @@ class OrderAutomation:
         try:
             result = await page.evaluate(js)
             if result:
-                await asyncio.sleep(0.1)
-                log.info(f"배송지 모드 → 직접입력 전환 (JS fallback: {result!r})")
+                log.info(f"배송지 모드 → 직접입력 전환 (JS): {result}")
                 return
         except Exception as exc:
-            log.debug(f"JS fallback 전환 실패: {exc}")
+            log.debug(f"JS 전환 실패: {exc}")
+
+        # 2) JS 가 못 잡았으면 셀렉터로 빠르게 시도 (timeout 짧게)
+        try:
+            loc = await self.selectors.find(
+                page, "order_page.direct_input_radio", timeout_ms=400
+            )
+            try:
+                if not await loc.is_checked():
+                    await loc.check()
+            except Exception:
+                pass
+            log.info("배송지 모드 → 직접입력 전환 (라디오)")
+            return
+        except ElementNotFoundError:
+            pass
+        except Exception:
+            pass
+
+        try:
+            await self.selectors.click(
+                page, "order_page.direct_input_label", timeout_ms=400
+            )
+            log.info("배송지 모드 → 직접입력 전환 (라벨)")
+            return
+        except Exception:
+            pass
 
         log.debug("직접입력 UI 없음 — 기본 흐름으로 진행")
 
