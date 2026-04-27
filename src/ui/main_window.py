@@ -233,6 +233,13 @@ class MainWindow(QMainWindow):
             self.table.setItemDelegateForColumn(status_col, self._status_delegate)
         self._status_delegate.start()
 
+        # 주소 컬럼 — 검색용 부분만 굵게 표시하는 delegate
+        from src.ui.widgets.address_delegate import AddressDelegate
+        self._address_delegate = AddressDelegate(self.table)
+        addr_col = self._find_column("수취인 주소")
+        if addr_col >= 0:
+            self.table.setItemDelegateForColumn(addr_col, self._address_delegate)
+
         self.content_stack.addWidget(self.table)
         self.content_stack.setCurrentWidget(self.empty_banner)
 
@@ -249,8 +256,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("준비")
 
     def _find_status_column(self) -> int:
+        return self._find_column("상태")
+
+    def _find_column(self, name: str) -> int:
         for c in range(self.model.columnCount()):
-            if self.model.headerData(c, Qt.Horizontal, Qt.DisplayRole) == "상태":
+            if self.model.headerData(c, Qt.Horizontal, Qt.DisplayRole) == name:
                 return c
         return -1
 

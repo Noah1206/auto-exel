@@ -20,6 +20,8 @@ log = get_logger()
 
 # 상태 컬럼은 delegate 가 직접 그리기 위해 상태 key 를 이 역할로 노출한다.
 STATUS_KEY_ROLE = Qt.UserRole + 1
+# 주소 컬럼에서 굵게 표시할 검색용 부분 (시/도 prefix + 괄호 제거)
+ADDRESS_SEARCH_QUERY_ROLE = Qt.UserRole + 2
 
 # 고정 컬럼: 상태 + 엑셀 입력 8개 + 엑셀 출력 2개 + 비고
 # 엑셀 행번호(#) 는 vertical header 에 표시되므로 별도 컬럼 없음.
@@ -214,6 +216,15 @@ class OrderTableModel(QAbstractTableModel):
         # 상태 key 를 delegate 에서 조회할 수 있도록 노출
         if role == STATUS_KEY_ROLE:
             return getattr(item, "status", "pending")
+
+        # 주소 컬럼에서 굵게 표시할 검색용 부분
+        if role == ADDRESS_SEARCH_QUERY_ROLE and col_name == "수취인 주소":
+            if isinstance(item, Order):
+                try:
+                    return item.address_search_query()
+                except Exception:
+                    return None
+            return None
 
         if role in (Qt.DisplayRole, Qt.EditRole):
             # 상태 컬럼은 StatusDelegate 가 직접 그리므로 빈 문자열 반환
