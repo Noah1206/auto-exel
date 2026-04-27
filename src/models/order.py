@@ -51,7 +51,10 @@ class Order(BaseModel):
 
     # 자동 채워지는 필드
     unit_price: int | None = Field(default=None, description="단가 (판매가 1개)")
-    total_price: int | None = Field(default=None, description="토탈가격 = 단가 × 수량")
+    total_price: int | None = Field(
+        default=None,
+        description="토탈가격 컬럼 — 정책상 '개당 단가' 를 저장 (수량 곱 X)",
+    )
     order_number: str | None = None
     ordered_at: datetime | None = None
     status: OrderStatus = "pending"
@@ -99,10 +102,10 @@ class Order(BaseModel):
         return validate_quantity(v)
 
     def compute_total(self) -> int | None:
-        """단가가 있으면 토탈가격을 계산해서 반환하고 필드에도 반영."""
+        """'토탈가격' 컬럼에는 단가를 그대로 저장한다 (수량 곱셈 안 함)."""
         if self.unit_price is None:
             return None
-        self.total_price = self.unit_price * self.quantity
+        self.total_price = self.unit_price
         return self.total_price
 
     def is_done(self) -> bool:

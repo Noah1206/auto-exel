@@ -422,11 +422,14 @@ class OrderAutomation:
                 order.order_number = order_no
                 order.ordered_at = datetime.now()
                 order.status = "completed"
-                # 실제 결제금액을 최우선으로 토탈가격에 반영 (배송비/할인/관세 포함).
-                # 추출 실패 시에만 단가 × 수량으로 fallback.
+                # '토탈가격' 컬럼에는 가격 조회로 채운 '개당 단가' 를 유지한다.
+                # 실제 결제금액(paid_amount) 은 로그에만 남기고 컬럼에 덮어쓰지 않는다.
                 if paid_amount is not None:
-                    order.total_price = paid_amount
-                elif order.total_price is None:
+                    log.info(
+                        f"행{order.row} 실제 결제금액(참고): {paid_amount:,}원 "
+                        f"(엑셀에는 개당 단가 {order.total_price} 유지)"
+                    )
+                if order.total_price is None:
                     try:
                         order.compute_total()
                     except Exception:
