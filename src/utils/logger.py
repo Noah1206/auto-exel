@@ -25,13 +25,17 @@ def setup_logger(
     log_dir_path.mkdir(parents=True, exist_ok=True)
 
     logger.remove()  # default stderr 제거
-    logger.add(
-        sys.stderr,
-        level=level,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - {message}",
-        enqueue=True,
-    )
+    # PyInstaller windowed 모드(console=False) 에선 sys.stderr 가 None 이라
+    # logger.add(None) 이 TypeError 를 던진다 (Windows .exe 에서 발생).
+    # stderr 가 살아있을 때만 콘솔 핸들러 등록.
+    if sys.stderr is not None:
+        logger.add(
+            sys.stderr,
+            level=level,
+            format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - {message}",
+            enqueue=True,
+        )
     logger.add(
         log_dir_path / "{time:YYYY-MM-DD}.log",
         level=level,
