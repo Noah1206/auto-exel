@@ -184,7 +184,7 @@ class MainWindow(QMainWindow):
         self.table.setItemDelegate(self._cell_editor_delegate)
 
         # 상태 컬럼에 pill + 스피너 delegate 설치 (기본 delegate 를 덮어씀)
-        def _is_awaiting(idx) -> bool:
+        def _is_awaiting_next(idx) -> bool:
             order = self._order_for_index(idx)
             if order is None or self.automation is None:
                 return False
@@ -202,11 +202,31 @@ class MainWindow(QMainWindow):
                 f"행 {order.row}: '다음으로' 신호 전송 — 주문번호 추출 중...", 4000
             )
 
+        def _is_awaiting_fill(idx) -> bool:
+            order = self._order_for_index(idx)
+            if order is None or self.automation is None:
+                return False
+            try:
+                return self.automation.is_awaiting_fill(order.row)
+            except Exception:
+                return False
+
+        def _on_fill(idx) -> None:
+            order = self._order_for_index(idx)
+            if order is None or self.automation is None:
+                return
+            self.automation.signal_fill(order.row)
+            self.statusBar().showMessage(
+                f"행 {order.row}: '기입' 신호 전송 — 주문서 자동 입력 중...", 4000
+            )
+
         self._status_delegate = StatusDelegate(
             self.table,
             status_getter=lambda idx: idx.data(STATUS_KEY_ROLE),
-            is_awaiting_next=_is_awaiting,
+            is_awaiting_next=_is_awaiting_next,
             on_next_clicked=_on_next,
+            is_awaiting_fill=_is_awaiting_fill,
+            on_fill_clicked=_on_fill,
         )
         status_col = self._find_status_column()
         if status_col >= 0:
@@ -422,11 +442,11 @@ class MainWindow(QMainWindow):
 
         # ── 툴바 구성: 엑셀 로드 이후에만 보이는 핵심 기능
         # '엑셀 불러오기' 는 시작 화면에서만 노출 — 툴바에서는 제외.
+        # 전체 '주문하기' 버튼은 제거 — 행을 더블클릭해 한 건씩만 진행.
         tb.addAction(self.action_back_home)      # ← 시작 화면 (맨 왼쪽)
         tb.addSeparator()
         tb.addAction(self.action_save_original)  # 원본에 저장
         tb.addAction(self.action_scrape)         # 가격 조회
-        tb.addAction(self.action_start_orders)   # 주문하기 ↔ 중단하기 토글
 
         # 초기: 엑셀 미로드 상태이므로 툴바 숨김
         tb.setVisible(False)

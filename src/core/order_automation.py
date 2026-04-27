@@ -94,27 +94,41 @@ class OrderAutomation:
         # order.row → "다음으로" 사용자 트리거 이벤트
         # (사용자가 결제 완료 후 행 메뉴에서 "다음으로" 를 누르면 set() 된다)
         self._next_events: dict[int, asyncio.Event] = {}
+        # order.row → "기입" 사용자 트리거 이벤트
+        # (수량 변경 후 사용자가 직접 '구매하기' 를 누르고 '기입' 버튼을 누를 때까지 대기)
+        self._fill_events: dict[int, asyncio.Event] = {}
 
     # -------------------------------------------------------------
     # User-triggered "next" — 사용자가 결제 완료 후 행 메뉴에서 "다음으로" 클릭 시
     # -------------------------------------------------------------
 
+    def _signal_event(self, ev: asyncio.Event | None) -> None:
+        if ev is None or ev.is_set():
+            return
+        try:
+            ev._loop.call_soon_threadsafe(ev.set)  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                ev.set()
+            except Exception:
+                pass
+
     def signal_next(self, row: int) -> None:
         """행에 대해 '다음으로' 트리거. 대기 중인 _await_user_next() 가 깨어난다."""
-        ev = self._next_events.get(row)
-        if ev is not None and not ev.is_set():
-            try:
-                ev._loop.call_soon_threadsafe(ev.set)  # type: ignore[attr-defined]
-            except Exception:
-                # fallback — 같은 스레드면 그냥 set
-                try:
-                    ev.set()
-                except Exception:
-                    pass
+        self._signal_event(self._next_events.get(row))
 
     def is_awaiting_next(self, row: int) -> bool:
         """해당 행이 사용자 '다음으로' 클릭을 기다리는 중인가."""
         ev = self._next_events.get(row)
+        return ev is not None and not ev.is_set()
+
+    def signal_fill(self, row: int) -> None:
+        """행에 대해 '기입' 트리거. 대기 중인 _await_user_fill() 이 깨어난다."""
+        self._signal_event(self._fill_events.get(row))
+
+    def is_awaiting_fill(self, row: int) -> bool:
+        """해당 행이 사용자 '기입' 클릭을 기다리는 중인가."""
+        ev = self._fill_events.get(row)
         return ev is not None and not ev.is_set()
 
     async def _await_user_next(self, row: int, timeout_sec: int = 1800) -> None:
@@ -125,6 +139,42 @@ class OrderAutomation:
             await asyncio.wait_for(ev.wait(), timeout=timeout_sec)
         finally:
             self._next_events.pop(row, None)
+
+    async def _switch_to_order_page(self, current_page: Page) -> Page:
+        """현재 컨텍스트의 모든 탭에서 주문서 URL(/pay/...) 인 탭을 찾아 반환.
+
+        사용자가 '구매하기' 누르면 새 탭이 열릴 수도, 기존 탭이 navigate 될 수도 있다.
+        주문서 페이지가 안 보이면 current_page 를 그대로 반환.
+        """
+        try:
+            ctx = current_page.context
+        except Exception:
+            return current_page
+        for p in ctx.pages:
+            try:
+                if p.is_closed():
+                    continue
+                url = p.url or ""
+                # 11번가 주문서 URL 패턴
+                if "/pay/" in url or "OrderInfoAction" in url or "orderInfo" in url.lower():
+                    return p
+            except Exception:
+                continue
+        return current_page
+
+    async def _await_user_fill(self, row: int, timeout_sec: int = 1800) -> None:
+        """행에 대해 사용자가 '기입' 누를 때까지 대기 (최대 30분).
+
+        흐름: 자동화가 상품페이지에서 수량 변경 후 이 함수에서 멈춘다.
+        사용자가 직접 Chrome 의 '구매하기' 버튼을 누르고, 메인 프로그램의
+        '기입' 버튼을 누르면 트리거되어 주문서 입력으로 이어진다.
+        """
+        ev = asyncio.Event()
+        self._fill_events[row] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout_sec)
+        finally:
+            self._fill_events.pop(row, None)
 
     # -------------------------------------------------------------
     # Public entrypoints
@@ -330,35 +380,38 @@ class OrderAutomation:
                 self._checkpoints[order.row] = Checkpoint.AT_PRODUCT_PAGE
                 cp = Checkpoint.AT_PRODUCT_PAGE
 
-            # 2) 바로구매 → 주문 페이지
+            # 2) 사용자가 직접 '구매하기' 누르고 '기입' 버튼 클릭 대기
             if cp == Checkpoint.AT_PRODUCT_PAGE:
-                self._emit(order, OrderState.CLICK_BUY, "바로구매 클릭")
-                await self._click_buy_now(page)
+                self._emit(
+                    order,
+                    OrderState.CLICK_BUY,
+                    "Chrome 에서 '구매하기' 를 누른 뒤 상태칸의 '📝 기입' 버튼을 눌러주세요",
+                )
+                await self._await_user_fill(order.row)
                 self._checkpoints[order.row] = Checkpoint.AT_ORDER_PAGE
                 cp = Checkpoint.AT_ORDER_PAGE
 
-            # 3) 주문 정보 입력
+            # 3) 주문 정보 입력 (사용자가 '기입' 누른 후 실행됨)
             if cp == Checkpoint.AT_ORDER_PAGE:
+                # 주문서 페이지가 떠 있는 활성 탭으로 page 핸들 갱신
+                page = await self._switch_to_order_page(page)
+                self._pages[order.row] = page
+
                 self._emit(order, OrderState.FILL_FORM, "주문자 정보 자동 입력")
                 await self._fill_order_form(page, order)
                 self._checkpoints[order.row] = Checkpoint.FORM_FILLED
                 cp = Checkpoint.FORM_FILLED
 
-            # 4) 결제 대기 / 자동 결제
+            # 4) 사용자가 결제 완료 후 '다음으로' 누를 때까지 대기
             if cp == Checkpoint.FORM_FILLED:
                 # 4-a) 결제 직전 샵백 추적 검증
                 self._verify_shopback_before_payment(order)
 
-                if self.config.auto_click_final_payment:
-                    self._emit(order, OrderState.WAIT_PAYMENT, "결제하기 클릭 중...")
-                    await self._click_final_payment(page)
-
                 # 결제·카드 인증 후 사용자가 직접 "다음으로" 를 눌러야 진행한다.
-                # (자동 polling 대신 명시적 트리거를 받는다.)
                 self._emit(
                     order,
                     OrderState.WAIT_PAYMENT,
-                    "브라우저에 '주문 완료' 페이지가 보이면 상태칸의 '▶ 다음으로' 버튼을 눌러주세요",
+                    "결제 완료 후 상태칸의 '▶ 다음으로' 버튼을 눌러주세요",
                 )
                 await self._await_user_next(order.row)
 

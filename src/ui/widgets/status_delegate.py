@@ -58,24 +58,31 @@ class StatusDelegate(QStyledItemDelegate):
         parent=None,
         is_awaiting_next=None,
         on_next_clicked=None,
+        is_awaiting_fill=None,
+        on_fill_clicked=None,
     ):
         """
         view: QTableView — repaint 를 위해 참조 필요
         status_getter: callable(index) -> str | None — 상태 key 반환
         is_awaiting_next: callable(index) -> bool — '다음으로' 버튼 노출 여부
         on_next_clicked: callable(index) -> None — '다음으로' 클릭 시 호출
+        is_awaiting_fill: callable(index) -> bool — '기입' 버튼 노출 여부
+        on_fill_clicked: callable(index) -> None — '기입' 클릭 시 호출
         """
         super().__init__(parent or view)
         self._view = view
         self._status_getter = status_getter
         self._is_awaiting_next = is_awaiting_next
         self._on_next_clicked = on_next_clicked
+        self._is_awaiting_fill = is_awaiting_fill
+        self._on_fill_clicked = on_fill_clicked
         self._spin_angle = 0
         self._timer = QTimer(self)
         self._timer.setInterval(self.SPINNER_INTERVAL_MS)
         self._timer.timeout.connect(self._on_tick)
-        # 행별 "다음으로" 버튼의 화면 영역 캐시 (클릭 hit-test 용)
+        # 행별 인라인 버튼의 화면 영역 캐시 (클릭 hit-test 용)
         self._next_btn_rects: dict[int, QRect] = {}
+        self._fill_btn_rects: dict[int, QRect] = {}
 
     # ---- 타이머 제어 ----
 
@@ -98,10 +105,13 @@ class StatusDelegate(QStyledItemDelegate):
         for row in range(model.rowCount()):
             idx = model.index(row, col)
             status = self._status_getter(idx)
-            awaiting = bool(
+            awaiting_next = bool(
                 self._is_awaiting_next and self._is_awaiting_next(idx)
             )
-            if status == "in_progress" or awaiting:
+            awaiting_fill = bool(
+                self._is_awaiting_fill and self._is_awaiting_fill(idx)
+            )
+            if status == "in_progress" or awaiting_next or awaiting_fill:
                 rect = self._view.visualRect(idx)
                 if rect.isValid():
                     self._view.viewport().update(rect)
@@ -215,11 +225,27 @@ class StatusDelegate(QStyledItemDelegate):
             )
             painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
 
-            # "다음으로" 인라인 버튼 — 사용자가 결제 완료 후 누르면
-            # OrderAutomation 이 주문번호를 추출하고 다음 행으로 진행한다.
+            # 인라인 버튼 — 같은 위치에 상황별로 하나만 그린다.
             row_key = index.row()
-            if self._is_awaiting_next and self._is_awaiting_next(index):
+            btn_label = None
+            btn_color = None
+            target_rect_dict = None
+            if self._is_awaiting_fill and self._is_awaiting_fill(index):
+                btn_label = "\U0001F4DD 기입"  # 📝
+                btn_color = QColor("#10B981")  # 초록
+                target_rect_dict = self._fill_btn_rects
+                # 다른 버튼 영역은 클리어
+                self._next_btn_rects.pop(row_key, None)
+            elif self._is_awaiting_next and self._is_awaiting_next(index):
                 btn_label = "\u25B6 다음으로"
+                btn_color = QColor("#2563EB")  # 파랑
+                target_rect_dict = self._next_btn_rects
+                self._fill_btn_rects.pop(row_key, None)
+            else:
+                self._next_btn_rects.pop(row_key, None)
+                self._fill_btn_rects.pop(row_key, None)
+
+            if btn_label is not None and btn_color is not None and target_rect_dict is not None:
                 btn_font = QFont(option.font)
                 btn_font.setWeight(QFont.Bold)
                 painter.setFont(btn_font)
@@ -227,20 +253,17 @@ class StatusDelegate(QStyledItemDelegate):
                 btn_text_w = bfm.horizontalAdvance(btn_label)
                 btn_h = pill_h
                 btn_w = btn_text_w + 22
-                # pill 우측 8px 갭 두고 배치, 셀 우측을 넘으면 클램프
+                # pill 우측 8px 갭, 셀 우측 넘으면 클램프
                 btn_x = pill_rect.right() + 8
                 if btn_x + btn_w > option.rect.right() - 4:
                     btn_x = option.rect.right() - 4 - btn_w
                 btn_rect = QRectF(btn_x, cy - btn_h / 2, btn_w, btn_h)
                 btn_path = QPainterPath()
                 btn_path.addRoundedRect(btn_rect, btn_h / 2, btn_h / 2)
-                painter.fillPath(btn_path, QColor("#2563EB"))
+                painter.fillPath(btn_path, btn_color)
                 painter.setPen(QColor("#FFFFFF"))
                 painter.drawText(btn_rect, Qt.AlignCenter, btn_label)
-                # hit-test 용 영역 저장 (정수 QRect)
-                self._next_btn_rects[row_key] = btn_rect.toRect()
-            else:
-                self._next_btn_rects.pop(row_key, None)
+                target_rect_dict[row_key] = btn_rect.toRect()
         finally:
             painter.restore()
 
@@ -269,20 +292,34 @@ class StatusDelegate(QStyledItemDelegate):
             painter.restore()
 
     def editorEvent(self, event, model, option, index) -> bool:
-        # "다음으로" 버튼 hit-test
-        if (
-            event.type() == QEvent.MouseButtonRelease
-            and self._on_next_clicked is not None
-            and self._is_awaiting_next is not None
-            and self._is_awaiting_next(index)
-        ):
-            rect = self._next_btn_rects.get(index.row())
-            if rect is not None and rect.contains(event.pos()):
-                try:
-                    self._on_next_clicked(index)
-                except Exception:
-                    pass
-                return True
+        # 인라인 버튼 hit-test (기입 / 다음으로)
+        if event.type() == QEvent.MouseButtonRelease:
+            # 기입 버튼 우선 (활성 상태일 때만 표시되므로 충돌 없음)
+            if (
+                self._on_fill_clicked is not None
+                and self._is_awaiting_fill is not None
+                and self._is_awaiting_fill(index)
+            ):
+                rect = self._fill_btn_rects.get(index.row())
+                if rect is not None and rect.contains(event.pos()):
+                    try:
+                        self._on_fill_clicked(index)
+                    except Exception:
+                        pass
+                    return True
+            # 다음으로 버튼
+            if (
+                self._on_next_clicked is not None
+                and self._is_awaiting_next is not None
+                and self._is_awaiting_next(index)
+            ):
+                rect = self._next_btn_rects.get(index.row())
+                if rect is not None and rect.contains(event.pos()):
+                    try:
+                        self._on_next_clicked(index)
+                    except Exception:
+                        pass
+                    return True
         return super().editorEvent(event, model, option, index)
 
     def sizeHint(self, option, index):
