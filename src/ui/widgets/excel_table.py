@@ -26,18 +26,14 @@ class ExcelTableView(QTableView):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 셀 단위 선택, 다중 영역 허용
-        self.setSelectionBehavior(QAbstractItemView.SelectItems)
+        # 행 단위 선택 — 셀 클릭 시 그 행 전체가 하이라이트
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        # 편집 트리거: 엑셀과 동일하게 더블클릭 또는 F2 일 때만 편집 시작.
-        # (단순 클릭/문자키로는 편집모드 진입 안 함 — 셀 선택만)
-        self.setEditTriggers(
-            QAbstractItemView.DoubleClicked
-            | QAbstractItemView.EditKeyPressed
-        )
+        # 편집 비활성 — 엑셀 데이터는 변경 불가 (자동화에 영향 주는 값 보호).
+        # 더블클릭은 단건 주문 트리거로 사용되므로 셀 편집 모드는 진입하지 않는다.
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         # Tab 포커스가 셀 이동이 되도록
         self.setTabKeyNavigation(True)
-        # Enter 로 편집 종료 시 아래로 이동 (Qt 기본 설정)
 
         # 스크롤바 숨김 — 휠/키보드 스크롤은 그대로 동작
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
