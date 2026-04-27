@@ -156,8 +156,13 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
-        # 주문 실행은 "상태" 컬럼 더블클릭일 때만 — 데이터 셀 더블클릭은 편집에 사용
+        # 주문 실행 트리거:
+        #   - "상태" 컬럼 더블클릭 → 단건 주문 (데이터 셀은 편집 모드 진입)
+        #   - 좌측 행 번호 헤더 더블클릭 → 단건 주문 (어디서든 빠르게)
         self.table.doubleClicked.connect(self._on_cell_double_clicked)
+        self.table.verticalHeader().sectionDoubleClicked.connect(
+            self._on_row_header_double_clicked
+        )
         # 엑셀 느낌: 격자 선 + 적당한 행 높이 + 고정폭 폰트 느낌의 숫자
         self.table.setShowGrid(True)
         self.table.setWordWrap(False)
@@ -931,8 +936,15 @@ class MainWindow(QMainWindow):
         )
         if col_name != "상태":
             return
+        self._start_single_order_for_row(index.row())
 
-        item = self.model.get_row(index.row())
+    def _on_row_header_double_clicked(self, row: int) -> None:
+        """좌측 행번호 헤더 더블클릭 → 그 행 단건 주문."""
+        self._start_single_order_for_row(row)
+
+    def _start_single_order_for_row(self, row_index: int) -> None:
+        """모델 row index 로 단건 주문 시작. 검증/완료여부/lock 까지 처리."""
+        item = self.model.get_row(row_index)
         if item is None:
             return
         if not isinstance(item, Order):
