@@ -30,11 +30,13 @@ from src.utils.logger import get_logger
 
 log = get_logger()
 
-# 입력 엑셀 필수 컬럼
+# 입력 엑셀 필수 컬럼 (스크린샷 순서와 동일)
+# "수취인번호.1" 은 보조 번호 — 자동화에는 사용 안 함, 단순 보존.
 REQUIRED_COLUMNS = (
     "구매처",
     "수취인",
     "수취인번호",
+    "수취인번호.1",
     "통관번호",
     "우편번호",
     "수취인 주소",
@@ -52,6 +54,7 @@ _INPUT_FIELD_MAP = {
     "구매처": "product_url",
     "수취인": "name",
     "수취인번호": "phone",
+    "수취인번호.1": "phone2",
     "통관번호": "customs_id",
     "우편번호": "postal_code",
     "수취인 주소": "address",

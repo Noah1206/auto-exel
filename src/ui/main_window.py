@@ -458,6 +458,13 @@ class MainWindow(QMainWindow):
         )
         self.action_eng_fill.triggered.connect(self._on_eng_fill_clicked_toolbar)
 
+        # 주문번호 가져오기 — 결제 완료 후 주문번호 추출 트리거
+        self.action_next = QAction("주문번호 가져오기", self)
+        self.action_next.setToolTip(
+            "결제 완료 페이지에서 주문번호를 추출해 엑셀에 저장합니다"
+        )
+        self.action_next.triggered.connect(self._on_next_clicked_toolbar)
+
         # 주문하기 / 중단하기 토글 — 한 버튼이 상태에 따라 역할 전환
         self.action_start_orders = QAction("주문하기", self)
         self.action_start_orders.setShortcut(QKeySequence("Ctrl+R"))
@@ -494,6 +501,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.action_scrape)         # 가격 조회
         tb.addAction(self.action_fill)           # 기입 (받는사람/주소/전화)
         tb.addAction(self.action_eng_fill)       # 영문기입 (통관/영문/나머지)
+        tb.addAction(self.action_next)           # 주문번호 가져오기 (결제 후)
 
         # 초기: 엑셀 미로드 상태이므로 툴바 숨김
         tb.setVisible(False)
@@ -976,6 +984,37 @@ class MainWindow(QMainWindow):
         )
         log.info(f"툴바 영문기입 클릭 → 행 {rows_str} 에 신호 전송")
 
+    def _on_next_clicked_toolbar(self) -> None:
+        """툴바 '주문번호 가져오기' 버튼 — 결제 완료 후 주문번호 추출 신호 전송."""
+        if self.automation is None:
+            self.statusBar().showMessage(
+                "주문이 시작된 행이 없습니다", 4000,
+            )
+            return
+        selected = self._selected_orders()
+        targets = [
+            o for o in selected
+            if self.automation.is_awaiting_next(o.row)
+        ]
+        if not targets:
+            for r in self.model.all_rows():
+                if isinstance(r, Order) and self.automation.is_awaiting_next(r.row):
+                    targets.append(r)
+        if not targets:
+            self.statusBar().showMessage(
+                "주문번호 추출 대기 중인 행이 없습니다 (결제 완료 후 사용 가능)",
+                4000,
+            )
+            return
+        for o in targets:
+            self.automation.signal_next(o.row)
+        rows_str = ", ".join(str(o.row) for o in targets)
+        self.statusBar().showMessage(
+            f"행 {rows_str}: '다음으로' 신호 전송 — 주문번호 추출 중...",
+            4000,
+        )
+        log.info(f"툴바 주문번호 가져오기 클릭 → 행 {rows_str} 에 신호 전송")
+
     def _on_scrape_prices(self) -> None:
         if self.excel_mgr is None or not self.model.all_rows():
             QMessageBox.warning(self, "알림", "먼저 엑셀을 불러와주세요.")
@@ -1450,6 +1489,16 @@ class MainWindow(QMainWindow):
 
             if self.excel_mgr:
                 self.excel_mgr.update_order(order)
+                # 단건 주문도 완료 즉시 디스크 저장 — 주문번호/토탈가격 유실 방지
+                if order.status == "completed":
+                    try:
+                        self.excel_mgr.save(self.model.all_rows())
+                        log.info(
+                            f"행{order.row} 엑셀 저장: 주문번호={order.order_number} "
+                            f"토탈가격={order.total_price}"
+                        )
+                    except Exception as exc:
+                        log.warning(f"행{order.row} 엑셀 저장 실패: {exc}")
 
             if order.status == "completed":
                 self.state_mgr.mark_completed(order)
@@ -1922,6 +1971,7 @@ class MainWindow(QMainWindow):
             "구매처": 280,
             "수취인": 80,
             "수취인번호": 130,
+            "수취인번호.1": 130,
             "통관번호": 130,
             "우편번호": 75,
             "수취인 주소": 240,

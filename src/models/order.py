@@ -43,6 +43,7 @@ class Order(BaseModel):
     product_url: str = Field(description="구매처 URL")
     name: str = Field(min_length=1, max_length=80, description="수취인")
     phone: str = Field(description="수취인번호")
+    phone2: str = Field(default="", description="수취인번호.1 (보조 번호 — 자동화에는 미사용)")
     customs_id: str = Field(description="통관번호")
     postal_code: str = Field(description="우편번호")
     address: str = Field(min_length=1, description="수취인 주소")
@@ -70,6 +71,22 @@ class Order(BaseModel):
     @classmethod
     def _v_phone(cls, v) -> str:
         return normalize_phone(v)
+
+    @field_validator("phone2", mode="before")
+    @classmethod
+    def _v_phone2(cls, v) -> str:
+        if v is None:
+            return ""
+        try:
+            s = str(v).strip()
+        except Exception:
+            return ""
+        if not s:
+            return ""
+        try:
+            return normalize_phone(s)
+        except Exception:
+            return s
 
     @field_validator("customs_id", mode="before")
     @classmethod

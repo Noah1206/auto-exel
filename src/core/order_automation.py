@@ -2653,18 +2653,44 @@ class OrderAutomation:
                 "카드 인증을 못 하셨거나 결제가 취소되었습니다."
             ) from exc
 
-        # 1) 주문번호 추출
+        # 1) 주문번호 추출 — 셀렉터 → 실패시 JS 페이지 텍스트 정규식 fallback
+        order_no: str | None = None
         try:
             text = await self.selectors.get_text(
                 page, "confirmation.order_number", timeout_ms=5000
             )
             import re
             match = re.search(r"[\d\-]{8,}", text)
-            order_no = match.group(0) if match else text
-        except ElementNotFoundError as exc:
+            order_no = match.group(0) if match else text.strip()
+        except ElementNotFoundError:
+            log.warning(
+                "주문번호 셀렉터 매칭 실패 → 페이지 텍스트에서 패턴 검색"
+            )
+
+        if not order_no:
+            # JS fallback: 페이지 텍스트에서 '주문번호' 라벨 근처 또는 8자리 이상
+            # 숫자/하이픈 패턴 추출. 11번가 주문번호는 보통 10~14자리 숫자.
+            try:
+                order_no = await page.evaluate(
+                    r"""() => {
+                      const body = document.body ? (document.body.innerText || '') : '';
+                      // 1) "주문번호" 라벨 뒤에 오는 숫자/하이픈
+                      let m = body.match(/주문\s*번호[^\d]{0,20}([0-9][0-9\-]{7,})/);
+                      if (m) return m[1];
+                      // 2) 페이지 내 가장 긴 숫자 시퀀스 (8자리 이상)
+                      const all = body.match(/[0-9][0-9\-]{7,}/g) || [];
+                      if (all.length === 0) return null;
+                      all.sort((a, b) => b.length - a.length);
+                      return all[0];
+                    }"""
+                )
+            except Exception as exc:
+                log.warning(f"JS 주문번호 추출 실패: {exc}")
+
+        if not order_no:
             raise ElementNotFoundError(
-                "주문번호 추출 실패: 완료 페이지의 주문번호 요소를 찾을 수 없습니다"
-            ) from exc
+                "주문번호 추출 실패: 완료 페이지에서 주문번호를 찾을 수 없습니다"
+            )
 
         # 2) 실제 결제금액 추출 (배송비/할인/관세 등 모두 반영된 최종 금액)
         paid_amount = await self._extract_paid_amount(page)
