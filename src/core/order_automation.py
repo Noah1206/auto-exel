@@ -1239,7 +1239,8 @@ class OrderAutomation:
                 return
             log.debug(f"영문이름 재시도 {attempt + 1}/3")
 
-        # 마지막 수단: JS 로 페이지 전체 input 을 훑어 영문이름 후보를 찾아 직접 주입
+        # 마지막 수단: JS 로 페이지 전체를 훑어 영문이름 후보를 찾아 직접 주입.
+        # 통관번호 영역 안의 input / select 까지 모두 탐색.
         try:
             injected = await page.evaluate(
                 r"""
@@ -1247,36 +1248,91 @@ class OrderAutomation:
   function setVal(el, v) {
     try { el.removeAttribute('readonly'); } catch(e){}
     try { el.removeAttribute('disabled'); } catch(e){}
-    const setter = Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype, 'value'
-    )?.set;
+    const proto = el.tagName === 'SELECT'
+      ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
     if (setter) setter.call(el, v); else el.value = v;
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.dispatchEvent(new Event('blur', {bubbles: true}));
   }
   function hayOf(el) {
     return [el.name||'', el.id||'', el.placeholder||'',
             el.getAttribute('aria-label')||''].join(' ').toLowerCase();
   }
+  function nearbyText(el) {
+    // 가까운 라벨/조상 텍스트 — '개인통관고유부호' 영역인지 판단용
+    let p = el.parentElement;
+    let collected = '';
+    for (let i = 0; p && i < 6; i++, p = p.parentElement) {
+      const t = (p.innerText || p.textContent || '').slice(0, 200);
+      if (t) collected += ' ' + t;
+    }
+    return collected.toLowerCase();
+  }
   const touched = [];
+
+  // 1) 일반 input — name/id/placeholder 에 'eng' 류 매칭
   for (const el of document.querySelectorAll('input')) {
     const t = (el.type||'').toLowerCase();
     if (['checkbox','radio','submit','button','file','image','hidden'].includes(t)) continue;
     const hay = hayOf(el);
-    if (/(eng.*nm|eng.*name|영문이름|hong\s*gildong|영문)/i.test(hay)) {
-      // first / last 분리 hint 가 있으면 그쪽 사용
-      if (firstName && /first|이름.*영문|^.*first.*$/i.test(hay)) {
+    if (/(eng.*nm|eng.*name|영문이름|hong\s*gildong|영문|engNm|prsnEngNm|psnEngNm|ordEngNm|rcvrEngNm)/i.test(hay)) {
+      if (firstName && /first|이름.*영문/i.test(hay)) {
         setVal(el, firstName);
         touched.push('first:' + (el.name || el.id));
         continue;
       }
-      if (lastName && /last|성.*영문|^.*last.*$/i.test(hay)) {
+      if (lastName && /last|성.*영문/i.test(hay)) {
         setVal(el, lastName);
         touched.push('last:' + (el.name || el.id));
         continue;
       }
       setVal(el, fullName);
       touched.push('full:' + (el.name || el.id));
+    }
+  }
+
+  // 2) 통관번호 영역 안의 input/select — 라벨에 영문이름 hint 가 없어도
+  //    근처 텍스트에 '개인통관고유부호' / 'P로 시작' / '영문' 이 있으면 해당 영역으로 간주
+  for (const el of document.querySelectorAll('input, select')) {
+    if (touched.find(x => x.includes(el.name) || x.includes(el.id))) continue;
+    if (el.tagName === 'INPUT') {
+      const t = (el.type||'').toLowerCase();
+      if (['checkbox','radio','submit','button','file','image','hidden'].includes(t)) continue;
+    }
+    const hay = hayOf(el);
+    // 통관번호 input 자체는 건너뛰기
+    if (/(prsn.*cstms|cstms.*cd|psnCsc|개인통관|통관.*번호|p로\s*시작)/i.test(hay)) continue;
+    // 우편/주소/전화 etc 도 건너뛰기
+    if (/(zip|post|우편|addr|주소|phone|tel|mbl|mobile|휴대|받는|수취인|recipient|rcvr.*nm|recv.*nm)/i.test(hay)) continue;
+    // 근처 텍스트로 통관번호 영역인지 판단
+    const near = nearbyText(el);
+    if (!/개인통관|통관.*고유부호|p로\s*시작/i.test(near)) continue;
+
+    // 이미 값이 있으면 건드리지 않음 (예: 통관번호 input 옆에 잘못 매칭 방지)
+    if (el.value && el.value.trim()) continue;
+
+    if (el.tagName === 'SELECT') {
+      // select 면 옵션 중 영문이름 매칭 시도
+      let matched = false;
+      for (const opt of el.options || []) {
+        const ot = (opt.innerText || opt.textContent || '').trim().toUpperCase();
+        if (ot === fullName.toUpperCase() || ot.includes(fullName.toUpperCase())) {
+          setVal(el, opt.value);
+          touched.push('select-opt:' + (el.name || el.id) + '=' + opt.value);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && el.options && el.options.length > 0) {
+        // 첫 번째 옵션 (보통 사용자 본인 이름)
+        setVal(el, el.options[0].value);
+        touched.push('select-first:' + (el.name || el.id));
+      }
+    } else {
+      setVal(el, fullName);
+      touched.push('customs-area-input:' + (el.name || el.id || el.placeholder));
     }
   }
   return touched;
