@@ -60,6 +60,8 @@ class StatusDelegate(QStyledItemDelegate):
         on_next_clicked=None,
         is_awaiting_fill=None,
         on_fill_clicked=None,
+        is_awaiting_eng_fill=None,
+        on_eng_fill_clicked=None,
     ):
         """
         view: QTableView — repaint 를 위해 참조 필요
@@ -76,6 +78,8 @@ class StatusDelegate(QStyledItemDelegate):
         self._on_next_clicked = on_next_clicked
         self._is_awaiting_fill = is_awaiting_fill
         self._on_fill_clicked = on_fill_clicked
+        self._is_awaiting_eng_fill = is_awaiting_eng_fill
+        self._on_eng_fill_clicked = on_eng_fill_clicked
         self._spin_angle = 0
         self._timer = QTimer(self)
         self._timer.setInterval(self.SPINNER_INTERVAL_MS)
@@ -83,6 +87,7 @@ class StatusDelegate(QStyledItemDelegate):
         # 행별 인라인 버튼의 화면 영역 캐시 (클릭 hit-test 용)
         self._next_btn_rects: dict[int, QRect] = {}
         self._fill_btn_rects: dict[int, QRect] = {}
+        self._eng_fill_btn_rects: dict[int, QRect] = {}
 
     # ---- 타이머 제어 ----
 
@@ -111,7 +116,11 @@ class StatusDelegate(QStyledItemDelegate):
             awaiting_fill = bool(
                 self._is_awaiting_fill and self._is_awaiting_fill(idx)
             )
-            if status == "in_progress" or awaiting_next or awaiting_fill:
+            awaiting_eng_fill = bool(
+                self._is_awaiting_eng_fill
+                and self._is_awaiting_eng_fill(idx)
+            )
+            if status == "in_progress" or awaiting_next or awaiting_fill or awaiting_eng_fill:
                 rect = self._view.visualRect(idx)
                 if rect.isValid():
                     self._view.viewport().update(rect)
@@ -136,8 +145,14 @@ class StatusDelegate(QStyledItemDelegate):
         awaiting_fill = bool(
             self._is_awaiting_fill and self._is_awaiting_fill(index)
         )
+        awaiting_eng_fill = (
+            not awaiting_fill
+            and self._is_awaiting_eng_fill is not None
+            and self._is_awaiting_eng_fill(index)
+        )
         awaiting_next = (
             not awaiting_fill
+            and not awaiting_eng_fill
             and self._is_awaiting_next is not None
             and self._is_awaiting_next(index)
         )
@@ -155,17 +170,25 @@ class StatusDelegate(QStyledItemDelegate):
             painter.setRenderHint(QPainter.Antialiasing, True)
 
             # ── awaiting 상태: 액션 버튼만 셀 중앙에 단독 표시
-            if awaiting_fill or awaiting_next:
+            if awaiting_fill or awaiting_eng_fill or awaiting_next:
                 if awaiting_fill:
                     btn_label = "기입"
-                    btn_color = QColor("#10B981")
+                    btn_color = QColor("#10B981")  # 초록
                     target_rect_dict = self._fill_btn_rects
                     self._next_btn_rects.pop(row_key, None)
+                    self._eng_fill_btn_rects.pop(row_key, None)
+                elif awaiting_eng_fill:
+                    btn_label = "영문기입"
+                    btn_color = QColor("#F59E0B")  # 주황
+                    target_rect_dict = self._eng_fill_btn_rects
+                    self._next_btn_rects.pop(row_key, None)
+                    self._fill_btn_rects.pop(row_key, None)
                 else:
                     btn_label = "다음으로"
-                    btn_color = QColor("#2563EB")
+                    btn_color = QColor("#2563EB")  # 파랑
                     target_rect_dict = self._next_btn_rects
                     self._fill_btn_rects.pop(row_key, None)
+                    self._eng_fill_btn_rects.pop(row_key, None)
 
                 btn_font = QFont(option.font)
                 btn_font.setWeight(QFont.DemiBold)
@@ -196,6 +219,7 @@ class StatusDelegate(QStyledItemDelegate):
             # ── 일반 상태: 알약 배지 표시 (기존 디자인)
             self._next_btn_rects.pop(row_key, None)
             self._fill_btn_rects.pop(row_key, None)
+            self._eng_fill_btn_rects.pop(row_key, None)
 
             font = QFont(option.font)
             font.setWeight(QFont.DemiBold)
@@ -289,9 +313,9 @@ class StatusDelegate(QStyledItemDelegate):
             painter.restore()
 
     def editorEvent(self, event, model, option, index) -> bool:
-        # 인라인 버튼 hit-test (기입 / 다음으로)
+        # 인라인 버튼 hit-test (기입 / 영문기입 / 다음으로)
         if event.type() == QEvent.MouseButtonRelease:
-            # 기입 버튼 우선 (활성 상태일 때만 표시되므로 충돌 없음)
+            # 기입 버튼
             if (
                 self._on_fill_clicked is not None
                 and self._is_awaiting_fill is not None
@@ -301,6 +325,19 @@ class StatusDelegate(QStyledItemDelegate):
                 if rect is not None and rect.contains(event.pos()):
                     try:
                         self._on_fill_clicked(index)
+                    except Exception:
+                        pass
+                    return True
+            # 영문기입 버튼
+            if (
+                self._on_eng_fill_clicked is not None
+                and self._is_awaiting_eng_fill is not None
+                and self._is_awaiting_eng_fill(index)
+            ):
+                rect = self._eng_fill_btn_rects.get(index.row())
+                if rect is not None and rect.contains(event.pos()):
+                    try:
+                        self._on_eng_fill_clicked(index)
                     except Exception:
                         pass
                     return True

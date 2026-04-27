@@ -97,6 +97,9 @@ class OrderAutomation:
         # order.row → "기입" 사용자 트리거 이벤트
         # (수량 변경 후 사용자가 직접 '구매하기' 를 누르고 '기입' 버튼을 누를 때까지 대기)
         self._fill_events: dict[int, asyncio.Event] = {}
+        # order.row → "영문기입" 사용자 트리거 이벤트
+        # (받는사람/주소 입력 후 사용자가 '영문기입' 을 눌러야 통관/영문/나머지 입력)
+        self._eng_fill_events: dict[int, asyncio.Event] = {}
 
     # -------------------------------------------------------------
     # User-triggered "next" — 사용자가 결제 완료 후 행 메뉴에서 "다음으로" 클릭 시
@@ -129,6 +132,15 @@ class OrderAutomation:
     def is_awaiting_fill(self, row: int) -> bool:
         """해당 행이 사용자 '기입' 클릭을 기다리는 중인가."""
         ev = self._fill_events.get(row)
+        return ev is not None and not ev.is_set()
+
+    def signal_eng_fill(self, row: int) -> None:
+        """행에 대해 '영문기입' 트리거. 대기 중인 _await_user_eng_fill() 이 깨어난다."""
+        self._signal_event(self._eng_fill_events.get(row))
+
+    def is_awaiting_eng_fill(self, row: int) -> bool:
+        """해당 행이 사용자 '영문기입' 클릭을 기다리는 중인가."""
+        ev = self._eng_fill_events.get(row)
         return ev is not None and not ev.is_set()
 
     async def _await_user_next(self, row: int, timeout_sec: int = 1800) -> None:
@@ -175,6 +187,19 @@ class OrderAutomation:
             await asyncio.wait_for(ev.wait(), timeout=timeout_sec)
         finally:
             self._fill_events.pop(row, None)
+
+    async def _await_user_eng_fill(self, row: int, timeout_sec: int = 1800) -> None:
+        """받는사람/주소 입력 후 사용자가 '영문기입' 누를 때까지 대기.
+
+        흐름: '기입' 으로 받는사람/주소까지 자동 입력 → 잠시 멈춤 →
+        사용자가 결과 확인 후 '영문기입' 누르면 통관/영문/나머지 자동 입력.
+        """
+        ev = asyncio.Event()
+        self._eng_fill_events[row] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout_sec)
+        finally:
+            self._eng_fill_events.pop(row, None)
 
     # -------------------------------------------------------------
     # Public entrypoints
@@ -1011,15 +1036,27 @@ class OrderAutomation:
         log.debug("직접입력 UI 없음 — 기본 흐름으로 진행")
 
     async def _fill_order_form(self, page: Page, order: Order) -> None:
+        """주문서 자동 입력 — 두 단계로 분리:
+
+        1단계 (이 함수에서 수행):
+          - 직접입력 모드 전환
+          - 받는사람 / 우편번호 / 기본주소 / 상세주소 (주소찾기 팝업까지 자동)
+          - 전화번호
+          - 그 후 사용자 '영문기입' 트리거 대기
+
+        2단계 (사용자가 '영문기입' 누르면):
+          - 통관번호
+          - 영문이름
+        """
         delay = self.config.typing_delay_ms
 
         # 0) 배송지 모드 → "직접입력" 으로 전환
         await self._switch_to_direct_input(page)
 
-        # 1) 모든 필드 일괄 주입 (이름/전화/우편/주소/통관/영문)
+        # 1) 모든 필드 일괄 주입 (이름/전화/우편/주소만 — 통관/영문은 2단계에서)
         await self._js_sweep_all_fields(page, order)
 
-        # 2) 받는사람 / 우편번호 / 기본주소 / 상세주소 셀렉터로 추가 보강
+        # 2) 받는사람 / 우편번호 / 기본주소 / 상세주소 셀렉터 보강
         await self._force_fill(
             page, "order_page.recipient_name", order.name, delay
         )
@@ -1033,10 +1070,10 @@ class OrderAutomation:
             page, "order_page.address_detail", order.address, delay
         )
 
-        # 2-b) 주소 입력 검증 + 필요 시 주소찾기 팝업으로 보강
+        # 2-b) 주소찾기 팝업 자동 처리
         await self._ensure_address_filled(page, order)
 
-        # 전화번호 - 통합 or 분리 필드
+        # 3) 전화번호 - 통합 or 분리 필드
         if await self.selectors.exists(page, "order_page.phone", timeout_ms=800):
             digits_only = order.phone.replace("-", "")
             await self._force_fill(
@@ -1059,11 +1096,19 @@ class OrderAutomation:
                     page, "order_page.phone_suffix", parts[2], delay
                 )
 
-        # 개인통관고유부호 입력 — 실패하면 주문을 실패시킨다 (무조건 들어가야 함)
+        # 4) 사용자가 '영문기입' 누를 때까지 대기 → 그 후 통관/영문 자동 입력
+        self._emit(
+            order,
+            OrderState.FILL_FORM,
+            "받는사람·주소·전화 입력 완료. 상태칸의 '영문기입' 버튼을 눌러주세요",
+        )
+        await self._await_user_eng_fill(order.row)
+
+        # 5) 통관번호 — 실패하면 주문을 실패시킨다
+        self._emit(order, OrderState.FILL_FORM, "통관번호·영문이름 자동 입력 중")
         await self._fill_customs_id_or_fail(page, order)
 
-        # 영문 이름 — 통합 필드 우선, 없으면 first/last 분리 필드, 그것도 없으면
-        # 잠깐 대기 후 재시도 (통관번호 조회 후에 노출되는 경우 대비).
+        # 6) 영문 이름 — 통합/분리/재시도/JS 강제 주입 4단계 fallback
         eng_name = (order.english_name or "").strip()
         if eng_name:
             await self._fill_english_name(page, eng_name, delay)
