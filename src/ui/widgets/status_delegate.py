@@ -226,18 +226,18 @@ class StatusDelegate(QStyledItemDelegate):
             painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
 
             # 인라인 버튼 — 같은 위치에 상황별로 하나만 그린다.
+            # 깔끔한 톤: 작은 폰트, 무이모지, 알약과 같은 높이.
             row_key = index.row()
             btn_label = None
             btn_color = None
             target_rect_dict = None
             if self._is_awaiting_fill and self._is_awaiting_fill(index):
-                btn_label = "\U0001F4DD 기입"  # 📝
+                btn_label = "기입"
                 btn_color = QColor("#10B981")  # 초록
                 target_rect_dict = self._fill_btn_rects
-                # 다른 버튼 영역은 클리어
                 self._next_btn_rects.pop(row_key, None)
             elif self._is_awaiting_next and self._is_awaiting_next(index):
-                btn_label = "\u25B6 다음으로"
+                btn_label = "다음으로"
                 btn_color = QColor("#2563EB")  # 파랑
                 target_rect_dict = self._next_btn_rects
                 self._fill_btn_rects.pop(row_key, None)
@@ -246,20 +246,25 @@ class StatusDelegate(QStyledItemDelegate):
                 self._fill_btn_rects.pop(row_key, None)
 
             if btn_label is not None and btn_color is not None and target_rect_dict is not None:
+                # 알약과 정확히 같은 높이로 맞추고, 폰트는 한 단계 작게.
                 btn_font = QFont(option.font)
-                btn_font.setWeight(QFont.Bold)
+                btn_font.setWeight(QFont.DemiBold)
+                base_pt = btn_font.pointSizeF()
+                if base_pt > 0:
+                    btn_font.setPointSizeF(max(8.0, base_pt - 1))
                 painter.setFont(btn_font)
                 bfm = painter.fontMetrics()
                 btn_text_w = bfm.horizontalAdvance(btn_label)
-                btn_h = pill_h
-                btn_w = btn_text_w + 22
-                # pill 우측 8px 갭, 셀 우측 넘으면 클램프
-                btn_x = pill_rect.right() + 8
+                btn_h = pill_h - 4  # 알약보다 약간 작게 (시각적 위계)
+                btn_w = btn_text_w + 16
+                # pill 우측 6px 갭, 셀 우측 넘으면 클램프
+                btn_x = pill_rect.right() + 6
                 if btn_x + btn_w > option.rect.right() - 4:
                     btn_x = option.rect.right() - 4 - btn_w
                 btn_rect = QRectF(btn_x, cy - btn_h / 2, btn_w, btn_h)
                 btn_path = QPainterPath()
-                btn_path.addRoundedRect(btn_rect, btn_h / 2, btn_h / 2)
+                radius = btn_h / 2
+                btn_path.addRoundedRect(btn_rect, radius, radius)
                 painter.fillPath(btn_path, btn_color)
                 painter.setPen(QColor("#FFFFFF"))
                 painter.drawText(btn_rect, Qt.AlignCenter, btn_label)
