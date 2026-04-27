@@ -1081,51 +1081,41 @@ class MainWindow(QMainWindow):
             logged_in = False
 
         if not logged_in:
-            # 로그인 페이지 띄우고 사용자에게 선택지 3개 제공
+            # 로그인 페이지 자동 오픈
             try:
                 await self.browser.open_login_page()
             except Exception as exc:
                 log.warning(f"로그인 페이지 자동 오픈 실패: {exc}")
 
-            choice = await self._ask_choice_async(
-                "11번가 로그인 확인",
-                "로그인 상태가 확인되지 않습니다.\n\n"
-                "방금 열린 Chrome 창에서 로그인하신 뒤 아래에서 선택해 주세요.\n\n"
-                "• [로그인 완료 — 재확인 후 주문]: 로그인 여부 다시 체크 후 주문 시작\n"
-                "• [그냥 바로 주문 시작]: 체크 건너뛰고 주문 진행 (이미 로그인됐다고 확신할 때)\n"
-                "• [취소]: 주문 중단",
-                ["로그인 완료 — 재확인 후 주문", "그냥 바로 주문 시작"],
-            )
-            if choice is None:
-                self._ui(lambda: self.statusBar().showMessage(
-                    "주문 취소됨 — 로그인 후 다시 시도하세요"))
-                return
-
-            if choice == 0:
-                # 재확인 — 짧게 3회만 (15초)
-                self._ui(lambda: self.statusBar().showMessage("로그인 확인 중... (최대 15초)"))
-                import asyncio as _aio
-                for attempt in range(3):
-                    try:
-                        logged_in = await self.browser.is_logged_in(timeout_sec=5.0)
-                    except Exception:
-                        logged_in = False
-                    if logged_in:
-                        log.info(f"로그인 확인됨 (시도 {attempt + 1}회)")
-                        break
-                    await _aio.sleep(3)
-
-                if not logged_in:
-                    proceed = await self._ask_yesno_async(
-                        "로그인 감지 실패",
-                        "로그인 상태가 여전히 감지되지 않습니다.\n\n"
-                        "그래도 주문을 진행할까요?\n"
-                        "(이미 로그인된 상태라면 진행해도 정상 동작합니다)",
-                        default_yes=True,
-                    )
-                    if not proceed:
-                        return
-            # choice == 1 은 "그냥 바로 주문 시작" → 아래로 떨어져 주문 시작
+            # 사용자가 Chrome 에서 로그인 완료할 때까지 무한 폴링.
+            # 사용자가 '중단' 누르면 self._abort_requested 가 True 가 되어 종료.
+            log.info("11번가 로그인 대기 시작 — Chrome 에서 로그인해 주세요")
+            self._ui(lambda: self.statusBar().showMessage(
+                "Chrome 에서 11번가 로그인을 완료해 주세요 (자동으로 감지합니다)"
+            ))
+            import asyncio as _aio
+            attempt = 0
+            while True:
+                if getattr(self, "_abort_requested", False):
+                    log.info("로그인 대기 중 사용자 중단 요청 → 주문 취소")
+                    self._ui(lambda: self.statusBar().showMessage(
+                        "주문 취소됨 (로그인 대기 중)"
+                    ))
+                    return
+                attempt += 1
+                try:
+                    logged_in = await self.browser.is_logged_in(timeout_sec=5.0)
+                except Exception:
+                    logged_in = False
+                if logged_in:
+                    log.info(f"로그인 감지됨 (시도 {attempt}회) — 주문 진행")
+                    break
+                # 5초마다 확인 — 너무 자주 체크해 Chrome 에 부담주지 않게
+                self._ui(lambda a=attempt: self.statusBar().showMessage(
+                    f"Chrome 에서 11번가 로그인을 완료해 주세요 "
+                    f"(자동 감지 중 · {a}회 체크)"
+                ))
+                await _aio.sleep(5)
 
         log.info("11번가 로그인 확인됨 — 주문 시작")
         # 대상 결정: 선택된 행이 있으면 그것만, 없으면 전체 valid 행
