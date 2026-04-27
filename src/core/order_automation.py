@@ -773,11 +773,21 @@ class OrderAutomation:
                 return int(v.strip())
         except Exception:
             pass
-        # 2) JS — 수량 컨테이너 안의 숫자 텍스트
+        # 2) JS — 11번가 아마존관 신 UI + 일반 수량 컨테이너
         try:
             v = await page.evaluate(
                 """() => {
-                    // input 우선
+                    // 11번가 아마존관 신 UI 우선
+                    const newUi = document.querySelector(
+                      '.c_product_input input[aria-live="assertive"], '
+                      + '.c-card-item__cart input[type="text"], '
+                      + 'input[aria-label="주문 수량"]'
+                    );
+                    if (newUi && newUi.value) {
+                      const n = parseInt(newUi.value.replace(/[^\\d]/g, ''), 10);
+                      if (!isNaN(n)) return n;
+                    }
+                    // 일반 input
                     const inp = document.querySelector(
                       'input[name*="qty" i], input[name*="Qty" i], '
                       + 'input[role="spinbutton"], input[aria-label*="수량"]'
@@ -786,7 +796,6 @@ class OrderAutomation:
                       const n = parseInt(inp.value.replace(/[^\\d]/g, ''), 10);
                       if (!isNaN(n)) return n;
                     }
-                    // 수량 박스의 숫자 span
                     const boxes = document.querySelectorAll(
                       '[class*="quantity" i], [class*="Quantity" i]'
                     );

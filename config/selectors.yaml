@@ -84,6 +84,12 @@ product_page:
     - 'button:has-text("장바구니")'
     - 'button.cart_add'
   quantity_input:
+    # 11번가 아마존관 신 UI (사이드바 카트 안의 input)
+    - '.c_product_input input[aria-live="assertive"]'
+    - '.c_product_input input.form_input'
+    - '.c-card-item__cart input[type="text"]'
+    - 'input[aria-label="주문 수량"]'
+    # 일반 11번가
     - 'input.qty_input'
     - 'input[name="selectQuantity"]'
     - 'input[name="buyQty"]'
@@ -94,21 +100,29 @@ product_page:
     - 'input[type="number"][aria-label*="수량"]'
     - 'input[aria-label*="수량"]'
     - 'input[role="spinbutton"]'
-    # 11번가 아마존관 — 옵션 박스 안의 수량 input
     - 'div[class*="option" i] input[type="text"][value]'
     - 'div[class*="quantity" i] input'
     - 'div[class*="Quantity" i] input'
   quantity_plus_button:
+    # 11번가 아마존관 신 UI — 사이드바 카트의 + 버튼 (count2 가 +)
+    - 'button.c_product_btn_count2'
+    - '.c_product_input .form_add button:nth-of-type(2)'
+    - '.c-card-item__cart button:nth-of-type(2)'
+    # 일반 패턴
     - 'button.qty_plus'
     - 'button[aria-label*="증가"]'
     - 'button[aria-label*="추가"]'
     - 'button[aria-label="+"]'
     - 'button[title*="증가"]'
-    # 11번가 아마존관 — 옵션 박스 우측 + 버튼
     - 'div[class*="quantity" i] button:nth-of-type(2)'
     - 'div[class*="Quantity" i] button:last-of-type'
     - 'button:has-text("+"):not(:has-text("추가하기"))'
   quantity_minus_button:
+    # 11번가 아마존관 신 UI — 사이드바 카트의 - 버튼 (count1 이 -)
+    - 'button.c_product_btn_count1'
+    - '.c_product_input .form_add button:nth-of-type(1)'
+    - '.c-card-item__cart button:nth-of-type(1)'
+    # 일반 패턴
     - 'button.qty_minus'
     - 'button[aria-label*="감소"]'
     - 'button[aria-label="-"]'
