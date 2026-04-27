@@ -1836,9 +1836,18 @@ class MainWindow(QMainWindow):
 
         on_done 콜백은 항상 Qt 메인 스레드에서 호출된다 (QTimer.singleShot 으로 마샬링).
         """
+        # 어떤 코루틴이 돌고 있는지 로그/디버깅용으로 이름 보존
+        try:
+            coro_name = getattr(coro, "__qualname__", None) or getattr(
+                coro, "__name__", "<coro>"
+            )
+        except Exception:
+            coro_name = "<coro>"
+        log.debug(f"_run_async 시작: {coro_name}")
         fut = self._runner.submit(coro)
         # 강제 중단 시 cancel 대상으로 쓰기 위해 현재 실행 중인 Future 를 저장.
         self._current_future = fut
+        self._current_future_name = coro_name
 
         def _bridge(f: Future) -> None:
             # add_done_callback 은 백그라운드 스레드에서 실행되므로,
@@ -1890,10 +1899,13 @@ class MainWindow(QMainWindow):
                     pass
             else:
                 # 진짜로 실행 중 — 모달 대신 상태바 안내만
+                running_name = getattr(self, "_current_future_name", "<unknown>")
                 self.statusBar().showMessage(
-                    "진행 중인 작업이 끝나면 다시 시도해 주세요", 3500
+                    f"'{running_name}' 작업이 끝나면 다시 시도해 주세요", 3500
                 )
-                log.info("_try_acquire 거절: 다른 작업 진행 중 (current_future 살아있음)")
+                log.info(
+                    f"_try_acquire 거절: 다른 작업 진행 중 — {running_name}"
+                )
                 return False
         self._busy = True
         return True
