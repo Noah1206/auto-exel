@@ -1871,6 +1871,7 @@ class MainWindow(QMainWindow):
 
         실제로 실행 중인 future 가 없는데도 _busy=True 인 경우
         (콜백이 어떤 이유로 호출 못 된 경우) 자동으로 해제한다.
+        모달은 띄우지 않고 상태바 메시지로만 안내.
         """
         if self._busy:
             # 자동 복구: 실제 실행 중인 future 가 없으면 stale lock 으로 간주
@@ -1888,25 +1889,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             else:
-                reply = QMessageBox.question(
-                    self,
-                    "이미 진행 중",
-                    "다른 자동화 작업이 이미 실행 중입니다.\n"
-                    "그래도 강제로 시작하시겠습니까?\n\n"
-                    "(현재 실행 중인 작업이 멈춰있다면 '예' 를 눌러 강제 시작)",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
+                # 진짜로 실행 중 — 모달 대신 상태바 안내만
+                self.statusBar().showMessage(
+                    "진행 중인 작업이 끝나면 다시 시도해 주세요", 3500
                 )
-                if reply != QMessageBox.Yes:
-                    return False
-                # 강제 해제 후 진행
-                log.warning("사용자가 강제로 _busy lock 을 해제하고 새 작업 시작")
-                self._busy = False
-                self._current_future = None
-                try:
-                    self._set_orders_button_running(False)
-                except Exception:
-                    pass
+                log.info("_try_acquire 거절: 다른 작업 진행 중 (current_future 살아있음)")
+                return False
         self._busy = True
         return True
 
