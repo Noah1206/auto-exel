@@ -180,11 +180,10 @@ class OrderAutomation:
     ) -> None:
         """다음 트리거 중 먼저 일어나는 쪽까지 대기:
           1) '기입' 버튼 클릭 → signal_fill(row)
-          2) 자동 감지: 주문서 페이지(/pay/...) 가 뜸 → 자동 진행
-          3) 페이지(또는 모든 컨텍스트 페이지) 닫힘 → UserInterventionRequired 예외
+          2) 페이지(또는 모든 컨텍스트 페이지) 닫힘 → UserInterventionRequired 예외
 
-        반환: 1/2 일 때 정상 return.
-        예외: 3 일 때 UserInterventionRequired (호출자가 행 종료 처리).
+        반환: 1 일 때 정상 return.
+        예외: 2 일 때 UserInterventionRequired (호출자가 행 종료 처리).
         """
         ev = asyncio.Event()
         self._fill_events[row] = ev
@@ -192,35 +191,6 @@ class OrderAutomation:
         async def _wait_user() -> str:
             await ev.wait()
             return "user"
-
-        async def _wait_order_page() -> str:
-            if page is None:
-                await asyncio.Event().wait()
-                return "order"
-            try:
-                ctx = page.context
-            except Exception:
-                await asyncio.Event().wait()
-                return "order"
-            poll = 0.7
-            while True:
-                try:
-                    for p in ctx.pages:
-                        if p.is_closed():
-                            continue
-                        url = p.url or ""
-                        if (
-                            "/pay/" in url
-                            or "OrderInfoAction" in url
-                            or "orderInfo" in url.lower()
-                        ):
-                            log.info(
-                                f"행{row}: 주문서 페이지 자동 감지 → '기입' 자동 트리거 ({url[:80]})"
-                            )
-                            return "order"
-                except Exception:
-                    pass
-                await asyncio.sleep(poll)
 
         async def _wait_pages_closed() -> str:
             """모든 페이지가 닫힐 때까지 폴링. 닫히면 'closed' 반환."""
@@ -248,7 +218,6 @@ class OrderAutomation:
         try:
             tasks = {
                 asyncio.create_task(_wait_user()),
-                asyncio.create_task(_wait_order_page()),
                 asyncio.create_task(_wait_pages_closed()),
             }
             done, pending = await asyncio.wait(
@@ -677,36 +646,55 @@ class OrderAutomation:
         if qty <= 0:
             return True
 
-        elapsed = 0.0
-        poll = 0.5
-        sidebar_seen = False
+        # 이벤트 기반: 옵션이 DOM 에 등장하는 순간 즉시 wait_for_function 이
+        # 풀린다. polling 보다 훨씬 빠르게 (수십 ms) 반응한다.
+        # close 감지를 위해 wait_for_function 과 close 이벤트를 race.
+        check_js = """() => {
+            const el = document.querySelector(
+              '.c_product_input input[aria-live="assertive"], '
+              + '.c-card-item__cart input[type="text"], '
+              + 'input[aria-label="주문 수량"], '
+              + 'input[name*="qty" i], input[name*="Qty" i], '
+              + 'input[role="spinbutton"], input[aria-label*="수량"]'
+            );
+            if (!el) return false;
+            const v = (el.value || '').replace(/[^0-9]/g, '');
+            return v.length > 0;
+        }"""
 
-        while elapsed < timeout_sec:
-            if page.is_closed():
-                log.info(
-                    f"행{order.row}: 페이지 닫힘 → 옵션 대기 종료 (행 종료)"
-                )
-                return False
-            try:
-                cur = await self._read_current_quantity(page)
-            except Exception:
-                cur = None
-            if cur is not None:
-                sidebar_seen = True
-                log.info(
-                    f"행{order.row}: 옵션 감지됨 (현재 수량={cur}) → "
-                    f"{qty} 로 조정 시도"
-                )
-                await self._select_quantity(page, order)
-                return True
-            await asyncio.sleep(poll)
-            elapsed += poll
+        async def _wait_closed() -> None:
+            while True:
+                if page.is_closed():
+                    return
+                await asyncio.sleep(0.2)
 
-        if not sidebar_seen:
-            log.warning(
-                f"행{order.row}: 옵션 대기 타임아웃 ({timeout_sec}s)"
-            )
-        return False
+        wait_task = asyncio.create_task(
+            page.wait_for_function(check_js, timeout=timeout_sec * 1000, polling=50)
+        )
+        close_task = asyncio.create_task(_wait_closed())
+
+        done, pending = await asyncio.wait(
+            {wait_task, close_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+
+        if close_task in done:
+            log.info(f"행{order.row}: 페이지 닫힘 → 옵션 대기 종료 (행 종료)")
+            return False
+
+        if page.is_closed():
+            return False
+
+        try:
+            cur = await self._read_current_quantity(page)
+        except Exception:
+            cur = None
+        log.info(
+            f"행{order.row}: 옵션 감지됨 (현재 수량={cur}) → {qty} 로 조정 시도"
+        )
+        await self._select_quantity(page, order)
+        return True
 
     async def _select_quantity(self, page: Page, order: Order) -> None:
         """수량을 order.quantity 만큼 맞춘다. 4가지 UI 패턴 지원:
