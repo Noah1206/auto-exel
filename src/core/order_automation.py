@@ -38,6 +38,7 @@ log = get_logger()
 
 class OrderState(str, Enum):
     IDLE = "idle"
+    PENDING = "pending"     # 대기 (실행 안 됨 / 사용자 취소 후 복귀)
     OPEN_PRODUCT = "open_product"
     CHECK_LOGIN = "check_login"
     SELECT_QUANTITY = "select_quantity"
@@ -269,6 +270,7 @@ class OrderAutomation:
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
                         checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                        reset_to_pending=True,
                     )
         finally:
             self._fill_events.pop(row, None)
@@ -495,6 +497,7 @@ class OrderAutomation:
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
                         checkpoint=Checkpoint.START.value,
+                        reset_to_pending=True,
                     )
 
                 self._checkpoints[order.row] = Checkpoint.AT_PRODUCT_PAGE
@@ -506,6 +509,7 @@ class OrderAutomation:
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
                         checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                        reset_to_pending=True,
                     )
                 self._emit(
                     order,
@@ -517,6 +521,7 @@ class OrderAutomation:
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
                         checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                        reset_to_pending=True,
                     )
                 self._checkpoints[order.row] = Checkpoint.AT_ORDER_PAGE
                 cp = Checkpoint.AT_ORDER_PAGE
@@ -572,6 +577,18 @@ class OrderAutomation:
             return order
 
         except UserInterventionRequired as exc:
+            # reset_to_pending=True 면 단순 사용자 취소 (페이지 닫음) → '대기' 로 복귀
+            if getattr(exc, "reset_to_pending", False):
+                order.status = "pending"
+                order.error_message = None
+                # 체크포인트도 START 로 리셋 (다시 더블클릭하면 처음부터)
+                self._checkpoints.pop(order.row, None)
+                self._emit(order, OrderState.PENDING, "사용자가 취소함 (대기 상태로 복귀)")
+                log.info(f"행{order.row}: 사용자 취소 → 대기 상태로 복귀")
+                await self.abandon(order, force_close=True)
+                return order
+
+            # 그 외 진짜 개입 필요 (주소 검색 실패 등) → paused
             order.status = "paused"
             order.error_message = f"사용자 개입 필요: {exc}"
             if exc.checkpoint:
@@ -581,8 +598,6 @@ class OrderAutomation:
                     pass
             self._emit(order, OrderState.PAUSED, str(exc))
             log.warning(f"행{order.row} 일시정지: {exc}")
-            # 일시정지도 오염 가능성이 있으므로 탭을 명시적으로 닫는다.
-            # (사용자가 원하면 우클릭 → '이어서 진행' 으로 새 탭에서 다시 시작)
             if getattr(self.config, "skip_on_pause", True):
                 await self.abandon(order, force_close=True)
             return order

@@ -66,7 +66,16 @@ class UserInterventionRequired(BrowserError):
     사용자가 브라우저에서 직접 수정 후 "이어서 진행"을 호출하게 한다.
     """
 
-    def __init__(self, message: str, checkpoint: str = "", detail: str = ""):
+    def __init__(
+        self,
+        message: str,
+        checkpoint: str = "",
+        detail: str = "",
+        reset_to_pending: bool = False,
+    ):
         super().__init__(message)
         self.checkpoint = checkpoint
         self.detail = detail
+        # True 면 행 status 를 'paused' 가 아닌 'pending'(대기) 로 되돌림.
+        # 사용자가 페이지를 닫아 단순 취소한 경우 사용.
+        self.reset_to_pending = reset_to_pending
