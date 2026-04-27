@@ -61,11 +61,8 @@ class BrowserManager:
                 f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
             ]
         elif sys.platform == "win32":
-            # 화면 안에 명확히 보이도록 좌표 + 크기 명시
-            launch_args += [
-                "--window-position=0,0",
-                f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
-            ]
+            # Windows: 최대화로 띄워서 화면에 무조건 보이게 — 포커스도 자연스럽게 가져감.
+            launch_args.append("--start-maximized")
         else:
             launch_args.append("--start-maximized")
 
