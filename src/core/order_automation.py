@@ -572,137 +572,55 @@ class OrderAutomation:
                     }
                   }
 
-                  // 2) 11번가 아마존관 옵션 박스 — '색상 07 Pink Magnolia' 같은
-                  //    드롭다운 박스. 클릭 한 번이 곧 '옵션 선택 + 추가' 액션이다.
-                  //    텍스트로 '색상/사이즈/옵션' 라벨이 보이는 박스를 클릭.
-                  function isInteractive(el) {
-                    if (!el) return false;
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (['button', 'a', 'select', 'input', 'label'].includes(tag)) return true;
-                    const role = el.getAttribute('role');
-                    if (role && /(button|combobox|listbox|option)/i.test(role)) return true;
-                    const cs = window.getComputedStyle(el);
-                    if (cs.cursor === 'pointer') return true;
-                    return false;
-                  }
-                  function visibleClickable(el) {
-                    if (!el) return false;
-                    if (el.disabled) return false;
-                    const cs = window.getComputedStyle(el);
-                    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width >= 16 && r.height >= 16;
-                  }
-
-                  // 옵션 영역으로 보이는 컨테이너들 — 우선 클래스 기반으로 찾고,
-                  // 못 찾으면 텍스트 매칭(색상/사이즈/옵션)으로 fallback.
-                  let optBoxes = Array.from(document.querySelectorAll(
-                    '[class*="option" i]:not([class*="add" i]):not([class*="more" i]):not([class*="추가" i]), '
-                    + '[class*="Option" i]:not([class*="Add" i]), '
-                    + '[class*="color" i], [class*="Color" i], '
-                    + '[class*="size" i], [class*="Size" i], '
-                    + '.prd_options, .opt_list, .option_list'
-                  ));
-
-                  // 11번가 아마존관: 라벨이 '색상' / '사이즈' / '옵션' 로 시작하는 박스
-                  if (optBoxes.length === 0) {
-                    const all = document.querySelectorAll('div, button, a, li');
-                    for (const el of all) {
-                      const t = (el.innerText || '').trim();
-                      if (!t || t.length > 60) continue;
-                      if (/^(색상|사이즈|옵션|color|size|option)\s/i.test(t)) {
-                        optBoxes.push(el);
-                      }
-                    }
-                  }
-
+                  // 2) 옵션 박스 — 색상/사이즈 등 클릭 가능한 li/button/label
+                  //    11번가 아마존관: '색상' 헤더 아래 동그란 색상 버튼들
+                  //    이미 선택된 항목(aria-pressed=true / .selected / .active)이 있으면 패스
                   function pickFromContainer(container) {
-                    if (!container) return null;
+                    if (!container) return false;
                     // 이미 선택된 게 있으면 패스
-                    const selDone = container.querySelector(
+                    const sel = container.querySelector(
                       '[aria-pressed="true"], [aria-selected="true"], '
                       + '.selected, .active, .on, [class*="selected" i], [class*="active" i]'
                     );
-                    if (selDone) return null;
-                    // 1) 컨테이너 안의 클릭 가능 후보
+                    if (sel) return false;
+                    // 클릭 가능한 후보
                     const candidates = container.querySelectorAll(
                       'button, a[role="button"], li[role="option"], label, '
-                      + 'input[type="radio"], [role="radio"], [role="combobox"], [role="button"]'
+                      + 'input[type="radio"], [role="radio"]'
                     );
                     for (const c of candidates) {
-                      if (!visibleClickable(c)) continue;
-                      try { c.click(); return c; } catch(e) { continue; }
+                      if (c.disabled) continue;
+                      const cs = window.getComputedStyle(c);
+                      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                      const r = c.getBoundingClientRect();
+                      if (r.width < 8 || r.height < 8) continue;
+                      try { c.click(); } catch(e) { continue; }
+                      return true;
                     }
-                    // 2) 후보가 없으면 컨테이너 자체가 클릭 가능한 드롭다운일 수 있음
-                    if (isInteractive(container) && visibleClickable(container)) {
-                      try { container.click(); return container; } catch(e) {}
-                    }
-                    return null;
+                    return false;
                   }
 
+                  // 옵션 영역으로 보이는 컨테이너들
+                  const optBoxes = document.querySelectorAll(
+                    '[class*="option" i]:not([class*="add" i]):not([class*="more" i]), '
+                    + '[class*="Option" i], '
+                    + '[class*="color" i], [class*="Color" i], '
+                    + '[class*="size" i], [class*="Size" i], '
+                    + '.prd_options, .opt_list, .option_list'
+                  );
                   for (const box of optBoxes) {
-                    const clicked = pickFromContainer(box);
-                    if (clicked) {
-                      picked.push('option-box-click:' + (
-                        (clicked.className || clicked.id || clicked.tagName) + ''
-                      ).slice(0, 40));
+                    if (pickFromContainer(box)) {
+                      picked.push('option-box:' + (box.className || box.id).slice(0, 40));
                     }
                   }
 
-                  // 3) 옵션 박스 클릭으로 펼쳐진 드롭다운/목록의 첫 항목 선택
-                  //    (클릭 후 잠깐 기다렸다가 새로 노출된 옵션 항목 클릭)
                   return picked;
                 }"""
             )
             if result:
-                log.info(f"행{order.row}: 옵션 박스 클릭: {result}")
-                # 드롭다운이 펼쳐질 시간
-                await asyncio.sleep(0.5)
-
-                # 펼쳐진 옵션 항목(li/option)이 있으면 첫 번째 선택
-                try:
-                    picked2 = await page.evaluate(
-                        r"""() => {
-                          const picked = [];
-                          // 펼쳐진 드롭다운/리스트에서 옵션 항목 찾기
-                          //  - role=option / li[role=option]
-                          //  - 컨테이너 클래스에 'list/dropdown/menu/options' 포함된 것의 자식 li/button
-                          const candidates = document.querySelectorAll(
-                            '[role="option"]:not([disabled]), '
-                            + 'li[role="option"]:not([disabled]), '
-                            + 'ul[role="listbox"] li, '
-                            + '[class*="dropdown" i] li:not([disabled]), '
-                            + '[class*="dropdown" i] button:not([disabled]), '
-                            + '[class*="menu" i][role="menu"] li, '
-                            + '[class*="optionList" i] li, '
-                            + '[class*="OptionList" i] li, '
-                            + '[class*="option_list" i] li'
-                          );
-                          for (const c of candidates) {
-                            const cs = window.getComputedStyle(c);
-                            if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                            const r = c.getBoundingClientRect();
-                            if (r.width < 8 || r.height < 8) continue;
-                            const t = (c.innerText || c.textContent || '').trim();
-                            if (!t) continue;
-                            if (/선택|필수|please|choose/i.test(t)) continue;
-                            try { c.click(); picked.push(t.slice(0, 30)); break; }
-                            catch(e) { continue; }
-                          }
-                          return picked;
-                        }"""
-                    )
-                    if picked2:
-                        log.info(f"행{order.row}: 펼쳐진 옵션 선택: {picked2}")
-                        await asyncio.sleep(0.3)
-                except Exception as exc:
-                    log.debug(f"행{order.row}: 옵션 항목 선택 실패: {exc}")
-
-                # "선택한 옵션 추가하기" 버튼이 있으면 자동 클릭 (사이드바 추가)
-                try:
-                    await self._maybe_click_add_option(page)
-                except Exception as exc:
-                    log.debug(f"행{order.row}: 옵션 추가 버튼 클릭 실패: {exc}")
+                log.info(f"행{order.row}: 옵션 자동 선택: {result}")
+                # 옵션 선택 후 DOM 갱신 (수량 컨트롤이 활성화되도록)
+                await asyncio.sleep(0.4)
             else:
                 log.debug(f"행{order.row}: 자동 선택할 옵션 없음")
         except Exception as exc:
