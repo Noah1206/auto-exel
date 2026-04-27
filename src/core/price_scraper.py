@@ -48,53 +48,90 @@ class PriceScraper:
         on_progress: ProgressCb | None = None,
         only_missing: bool = True,
     ) -> list[Order]:
-        """가격 스크랩 순차 실행.
+        """가격 스크랩 병렬 실행.
 
-        only_missing=True 이면 total_price가 비어있는 주문만 대상.
+        only_missing=True 이면 total_price 가 비어있는 주문만 대상.
         결과는 order.unit_price / order.total_price 에 기록.
+        config.concurrent 만큼 동시에 페이지를 열어 가격을 긁는다.
         """
         self._cancel = False
         targets = [o for o in orders if (not only_missing) or o.needs_price()]
         total = len(targets)
-        log.info(f"가격 조회 시작: {total}건 (전체 {len(orders)}건 중)")
+        concurrent = max(1, int(getattr(self.config, "concurrent", 1) or 1))
+        log.info(
+            f"가격 조회 시작: {total}건 (전체 {len(orders)}건 중) — 동시 {concurrent}개"
+        )
 
-        page = await self.browser.new_page()
-        try:
-            for i, order in enumerate(targets, start=1):
+        if total == 0:
+            return orders
+
+        sem = asyncio.Semaphore(concurrent)
+        completed = 0
+        completed_lock = asyncio.Lock()
+
+        async def _worker(idx: int, order: Order) -> None:
+            nonlocal completed
+            if self._cancel:
+                return
+            async with sem:
                 if self._cancel:
-                    log.info("가격 조회 취소됨")
-                    break
+                    return
+                # 각 워커는 자기 전용 페이지 사용 (동시성 안전)
+                page = None
                 try:
-                    unit = await self._scrape_one(page, order)
-                    order.unit_price = unit
-                    order.compute_total()
-                    log.info(
-                        f"[{i}/{total}] 행{order.row} 단가: {unit:,}원 × {order.quantity} "
-                        f"= {order.total_price:,}원"
-                    )
-                except ProductUnavailableError as exc:
-                    # HTTP 404 — 페이지 자체가 없는 경우만 unavailable
-                    order.status = "unavailable"
-                    order.error_message = f"페이지 없음: {exc.reason}"
-                    log.warning(
-                        f"[{i}/{total}] 행{order.row} HTTP 404 — {exc.reason}"
-                    )
-                except Exception as exc:
-                    log.warning(f"[{i}/{total}] 행{order.row} 가격 조회 실패: {exc}")
-                    # 첫 실패 시 진단 정보 자동 저장 (이후 실패는 같은 원인일 가능성 높음)
-                    if i == 1 or i % 10 == 0:
-                        await self._save_diagnostics(page, order)
+                    page = await self.browser.new_page()
+                    try:
+                        unit = await self._scrape_one(page, order)
+                        order.unit_price = unit
+                        order.compute_total()
+                        log.info(
+                            f"[{idx}/{total}] 행{order.row} 단가: {unit:,}원 "
+                            f"× {order.quantity} = {order.total_price:,}원"
+                        )
+                    except ProductUnavailableError as exc:
+                        order.status = "unavailable"
+                        order.error_message = f"페이지 없음: {exc.reason}"
+                        log.warning(
+                            f"[{idx}/{total}] 행{order.row} HTTP 404 — {exc.reason}"
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            f"[{idx}/{total}] 행{order.row} 가격 조회 실패: {exc}"
+                        )
+                        # 진단 파일은 첫 실패 / 10번째마다 1회만 저장 (디스크 절약)
+                        if idx == 1 or idx % 10 == 0:
+                            try:
+                                await self._save_diagnostics(page, order)
+                            except Exception:
+                                pass
                 finally:
+                    if page is not None:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    async with completed_lock:
+                        completed += 1
+                        cur = completed
                     if on_progress:
-                        on_progress(i, total, order)
-                    if i < total:
-                        await asyncio.sleep(self.config.inter_request_delay_ms / 1000)
-        finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
+                        try:
+                            on_progress(cur, total, order)
+                        except Exception:
+                            pass
+                    # 동시성이 너무 높을 때 11번가 부하 완화용 짧은 딜레이
+                    delay_ms = getattr(self.config, "inter_request_delay_ms", 0) or 0
+                    if delay_ms > 0:
+                        await asyncio.sleep(delay_ms / 1000)
 
+        tasks = [
+            asyncio.create_task(_worker(i, order))
+            for i, order in enumerate(targets, start=1)
+        ]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if self._cancel:
+                log.info("가격 조회 취소됨")
         return orders
 
     def missing_price_orders(self, orders: list[Order]) -> list[Order]:
