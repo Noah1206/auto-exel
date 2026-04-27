@@ -1074,16 +1074,20 @@ class OrderAutomation:
             await self._fill_english_name(page, eng_name, delay)
 
     async def _ensure_address_filled(self, page: Page, order: Order) -> None:
-        """주소 입력 검증 + 부족하면 주소찾기 팝업으로 보강.
+        """주소 입력 — 주소찾기 팝업 절대 열지 않고 라벨에 직접 다 주입.
 
         흐름:
-          1) 라벨에 직접 주입한 결과를 검증 (postal/base/detail 모두 비어있나)
-          2) 비어있는 게 있으면 주소찾기 버튼 자동 클릭
-          3) 팝업 떠 있으면 우편번호 검색 + 가장 유사한 결과 자동 선택
-          4) 결과 선택 후 detail input 에 수취인 주소 전체 재주입
-          5) 어디서 실패해도 best-effort — 사용자 개입 모달 띄우지 않음
+          1) JS 로 우편/기본주소/상세주소 라벨에 강제 주입 (readonly 해제 + 값 세팅)
+          2) 입력 후 비어있는 칸이 있으면 한 번 더 재시도
+          3) 결과를 로그에 남김. 사용자 개입 모달/팝업 절대 없음.
         """
-        # 1) 현재 입력 값 점검
+        # 1) JS 로 라벨에 강제 주입
+        await self._js_inject_address_fields(page, order)
+
+        # 잠깐 대기 후 검증 (React/Vue 등 비동기 렌더 대비)
+        await asyncio.sleep(0.3)
+
+        # 2) 점검 — 비어있는 칸이 있으면 재시도
         try:
             status = await page.evaluate(
                 r"""() => {
@@ -1100,115 +1104,31 @@ class OrderAutomation:
             )
         except Exception:
             status = None
+
         if status:
             log.info(
-                f"행{order.row}: 주소 입력 점검 — "
+                f"행{order.row}: 주소 점검 — "
                 f"postal={status.get('postal')!r} "
                 f"base={status.get('base')!r} "
                 f"detail={status.get('detail')!r}"
             )
-            if (
+            # 비어있는 칸이 있으면 재주입
+            missing = not (
                 status.get("postal")
                 and status.get("base")
                 and status.get("detail")
-            ):
-                # 모두 채워짐 — 추가 작업 불필요
-                return
-
-        # 2) 주소찾기 버튼 자동 클릭 시도 (팝업이 이미 떠 있으면 스킵)
-        popup_open = await self.selectors.exists(
-            page, "order_page.zipcode_popup_container", timeout_ms=400
-        )
-        if not popup_open:
-            try:
-                if await self.selectors.exists(
-                    page, "order_page.zipcode_search_button", timeout_ms=1500
-                ):
-                    await self.selectors.click(
-                        page, "order_page.zipcode_search_button"
-                    )
-                    log.info(f"행{order.row}: 주소찾기 버튼 자동 클릭")
-                    # 팝업 뜰 때까지 잠깐 대기
-                    for _ in range(20):
-                        if await self.selectors.exists(
-                            page,
-                            "order_page.zipcode_popup_container",
-                            timeout_ms=300,
-                        ):
-                            popup_open = True
-                            break
-                        await asyncio.sleep(0.2)
-            except Exception as exc:
-                log.debug(f"행{order.row}: 주소찾기 버튼 클릭 실패: {exc}")
-
-        if not popup_open:
-            log.warning(
-                f"행{order.row}: 주소찾기 팝업을 못 열었습니다 — "
-                "라벨 직접 주입 값으로 진행"
             )
-            # 마지막 수단: JS 로 라벨에 한번 더 강제 주입
-            await self._js_inject_address_fields(page, order)
-            return
-
-        # 3) 팝업이 떠 있으면 우편번호 검색
-        delay = self.config.typing_delay_ms
-        try:
-            if await self.selectors.exists(
-                page, "order_page.zipcode_popup_search_input", timeout_ms=2000
-            ):
-                await self.selectors.fill(
-                    page,
-                    "order_page.zipcode_popup_search_input",
-                    order.postal_code,
-                    typing_delay_ms=delay,
-                )
-                if await self.selectors.exists(
-                    page,
-                    "order_page.zipcode_popup_search_button",
-                    timeout_ms=500,
-                ):
-                    await self.selectors.click(
-                        page, "order_page.zipcode_popup_search_button"
-                    )
-                else:
-                    try:
-                        await page.keyboard.press("Enter")
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.8)
-                # 4) 가장 유사한 결과 클릭
-                picked = await self._pick_best_zipcode_result(
-                    page, order.address
-                )
-                if picked:
-                    await asyncio.sleep(0.5)
-                    log.info(f"행{order.row}: 주소찾기 결과 자동 선택 완료")
-                else:
-                    log.warning(
-                        f"행{order.row}: 검색 결과에서 적합한 항목을 못 찾음"
-                    )
-        except Exception as exc:
-            log.warning(f"행{order.row}: 우편번호 팝업 처리 실패: {exc}")
-
-        # 5) detail 칸에 수취인 주소 전체 재주입 (도로명 + 동/호수 등)
-        try:
-            if await self.selectors.exists(
-                page, "order_page.address_detail", timeout_ms=1500
-            ):
-                await self._force_fill(
-                    page, "order_page.address_detail", order.address, delay
-                )
-        except Exception as exc:
-            log.debug(f"행{order.row}: 상세주소 재주입 실패: {exc}")
-
-        # 6) 라벨에 한 번 더 JS 강제 주입 (팝업으로 base 가 들어왔어도
-        #    detail 이 비어있을 수 있어서 안전망)
-        await self._js_inject_address_fields(page, order)
+            if missing:
+                log.info(f"행{order.row}: 주소 일부 비어있음 → 재주입")
+                await self._js_inject_address_fields(page, order)
 
     async def _js_inject_address_fields(self, page: Page, order: Order) -> None:
         """우편번호 / 기본주소 / 상세주소 input 에 JS 로 직접 값 주입.
 
-        라벨 매칭 실패해도 placeholder/name/id 에 'addr/zip' 패턴이면 채운다.
+        - readonly/disabled 강제 해제
+        - 기존 값 무시하고 무조건 덮어쓰기 (이전 자동화 시도가 잘못된 값을 넣었을 수 있음)
+        - placeholder/name/id/aria-label 어디든 매칭되면 주입
+        - input/change 이벤트 dispatch (React/Vue 의 controlled input 도 동작)
         """
         try:
             touched = await page.evaluate(
@@ -1222,6 +1142,7 @@ class OrderAutomation:
                     if (setter) setter.call(el, v); else el.value = v;
                     el.dispatchEvent(new Event('input', {bubbles: true}));
                     el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('blur', {bubbles: true}));
                   }
                   function hayOf(el) {
                     return [el.name||'', el.id||'', el.placeholder||'',
@@ -1232,22 +1153,28 @@ class OrderAutomation:
                     const t = (el.type||'').toLowerCase();
                     if (['checkbox','radio','submit','button','file','image','hidden'].includes(t)) continue;
                     const hay = hayOf(el);
-                    // 우편번호
-                    if (/(zip|post|우편)/.test(hay) && !el.value) {
+                    // 우편번호 — 무조건 덮어씀
+                    if (/(zip|post|우편)/.test(hay)) {
                       setVal(el, postal);
-                      touched.push('postal:' + (el.name || el.id));
+                      touched.push('postal:' + (el.name || el.id || el.placeholder));
                       continue;
                     }
-                    // 상세주소 (먼저 — 'addr' 매칭 전에)
+                    // 상세주소 (먼저 매칭 — 'addr' 매칭이 base 로 빠지지 않게)
                     if (/(상세.*주소|상세.*건물|addr.*dtl|dtls.*addr|addrDetail|rcvrDtls)/i.test(hay)) {
                       setVal(el, address);
-                      touched.push('detail:' + (el.name || el.id));
+                      touched.push('detail:' + (el.name || el.id || el.placeholder));
                       continue;
                     }
                     // 기본주소
-                    if (/(기본.*주소|base.*addr|baseAddr|rcvrBaseAddr)/i.test(hay) && !el.value) {
+                    if (/(기본.*주소|base.*addr|baseAddr|rcvrBaseAddr|^addr$|pickupBaseAddr)/i.test(hay)) {
                       setVal(el, address);
-                      touched.push('base:' + (el.name || el.id));
+                      touched.push('base:' + (el.name || el.id || el.placeholder));
+                      continue;
+                    }
+                    // 그 외 'addr' 가 들어가 있으면 일단 base 로 간주 (가장 마지막 fallback)
+                    if (/addr|주소/i.test(hay) && !el.value) {
+                      setVal(el, address);
+                      touched.push('addr-fallback:' + (el.name || el.id || el.placeholder));
                       continue;
                     }
                   }
@@ -1257,6 +1184,8 @@ class OrderAutomation:
             )
             if touched:
                 log.info(f"행{order.row}: 주소 JS 강제 주입: {touched}")
+            else:
+                log.warning(f"행{order.row}: 주소 주입 대상 input 을 못 찾음")
         except Exception as exc:
             log.debug(f"행{order.row}: 주소 JS 강제 주입 실패: {exc}")
 
