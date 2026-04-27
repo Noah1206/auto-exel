@@ -517,10 +517,11 @@ class OrderAutomation:
             )
 
     async def _select_quantity(self, page: Page, order: Order) -> None:
-        """수량을 order.quantity 만큼 맞춘다. 3가지 UI 패턴 지원:
+        """수량을 order.quantity 만큼 맞춘다. 4가지 UI 패턴 지원:
         1) <select> 드롭다운 — selectOption
-        2) <input type=number> — fill
-        3) + / - 버튼 — 차이만큼 클릭
+        2) <input> — fill (현재 값 읽고 다르면 덮어쓰기)
+        3) + / - 버튼 — 현재 수량 읽어서 차이만큼 클릭
+        4) JS fallback — 페이지에서 수량 컨테이너를 찾아 직접 조작
         """
         qty = order.quantity
         if qty <= 0:
@@ -528,8 +529,11 @@ class OrderAutomation:
 
         # 1) select 우선
         try:
-            sel = await self.selectors.find(page, "product_page.quantity_select", timeout_ms=1000)
+            sel = await self.selectors.find(
+                page, "product_page.quantity_select", timeout_ms=800
+            )
             await sel.select_option(str(qty))
+            log.info(f"행{order.row}: 수량 select 로 {qty} 선택")
             return
         except ElementNotFoundError:
             pass
@@ -539,30 +543,158 @@ class OrderAutomation:
             inp = await self.selectors.find(
                 page, "product_page.quantity_input", timeout_ms=800
             )
+            # 현재 값 확인
+            try:
+                cur_val = await inp.input_value()
+            except Exception:
+                cur_val = ""
+            await inp.click()
+            try:
+                await inp.fill("")
+            except Exception:
+                pass
             await inp.fill(str(qty))
             try:
                 await inp.press("Tab")
             except Exception:
                 pass
+            # change 이벤트가 안 발화되는 경우 대비 — JS 로 강제 발화
+            try:
+                await inp.evaluate(
+                    "el => { el.dispatchEvent(new Event('input', {bubbles: true}));"
+                    " el.dispatchEvent(new Event('change', {bubbles: true})); }"
+                )
+            except Exception:
+                pass
+            log.info(
+                f"행{order.row}: 수량 input 으로 {qty} 입력 (이전 값={cur_val!r})"
+            )
+            await asyncio.sleep(0.2)
             return
         except ElementNotFoundError:
             pass
 
-        # 3) + 버튼 반복 클릭
-        if qty > 1:
+        # 3) + / - 버튼 — 현재 수량 읽어서 차이만큼 클릭
+        try:
+            current = await self._read_current_quantity(page)
+        except Exception:
+            current = 1
+        if current is None:
+            current = 1
+        diff = qty - current
+        if diff != 0:
             try:
-                plus = await self.selectors.find(
-                    page, "product_page.quantity_plus_button", timeout_ms=800
+                if diff > 0:
+                    btn = await self.selectors.find(
+                        page,
+                        "product_page.quantity_plus_button",
+                        timeout_ms=800,
+                    )
+                    for _ in range(diff):
+                        await btn.click()
+                        await asyncio.sleep(0.1)
+                else:
+                    btn = await self.selectors.find(
+                        page,
+                        "product_page.quantity_minus_button",
+                        timeout_ms=800,
+                    )
+                    for _ in range(-diff):
+                        await btn.click()
+                        await asyncio.sleep(0.1)
+                log.info(
+                    f"행{order.row}: 수량 +/- 버튼으로 {current} → {qty} 조정"
                 )
-                for _ in range(qty - 1):
-                    await plus.click()
-                    await asyncio.sleep(0.05)
                 return
             except ElementNotFoundError:
                 pass
 
+        # 4) JS fallback — 페이지의 수량 영역을 추론해서 직접 조작
+        if await self._set_quantity_via_js(page, qty):
+            log.info(f"행{order.row}: 수량 JS fallback 으로 {qty} 설정")
+            return
+
         if qty > 1:
-            log.warning(f"행{order.row}: 수량 선택 UI를 찾지 못함 (수량={qty}). 기본값 1로 진행")
+            log.warning(
+                f"행{order.row}: 수량 선택 UI를 찾지 못함 (수량={qty}). "
+                "사용자가 직접 조정해 주세요"
+            )
+
+    async def _read_current_quantity(self, page: Page) -> int | None:
+        """현재 페이지에 표시된 수량 값을 읽는다."""
+        # 1) input value
+        try:
+            inp = await self.selectors.find(
+                page, "product_page.quantity_input", timeout_ms=400
+            )
+            v = await inp.input_value()
+            if v and v.strip().isdigit():
+                return int(v.strip())
+        except Exception:
+            pass
+        # 2) JS — 수량 컨테이너 안의 숫자 텍스트
+        try:
+            v = await page.evaluate(
+                """() => {
+                    // input 우선
+                    const inp = document.querySelector(
+                      'input[name*="qty" i], input[name*="Qty" i], '
+                      + 'input[role="spinbutton"], input[aria-label*="수량"]'
+                    );
+                    if (inp && inp.value) {
+                      const n = parseInt(inp.value.replace(/[^\\d]/g, ''), 10);
+                      if (!isNaN(n)) return n;
+                    }
+                    // 수량 박스의 숫자 span
+                    const boxes = document.querySelectorAll(
+                      '[class*="quantity" i], [class*="Quantity" i]'
+                    );
+                    for (const b of boxes) {
+                      const t = (b.innerText || '').trim();
+                      const m = t.match(/^\\s*(\\d+)\\s*$/m);
+                      if (m) return parseInt(m[1], 10);
+                    }
+                    return null;
+                }"""
+            )
+            if isinstance(v, (int, float)):
+                return int(v)
+        except Exception:
+            pass
+        return None
+
+    async def _set_quantity_via_js(self, page: Page, qty: int) -> bool:
+        """JS 로 수량 input/스피너 값을 직접 세팅 + change 이벤트 발화."""
+        try:
+            ok = await page.evaluate(
+                r"""(qty) => {
+                    function setVal(el, v) {
+                      try { el.removeAttribute('readonly'); } catch(e){}
+                      try { el.removeAttribute('disabled'); } catch(e){}
+                      const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value'
+                      )?.set;
+                      if (setter) setter.call(el, String(v));
+                      else el.value = String(v);
+                      el.dispatchEvent(new Event('input', {bubbles: true}));
+                      el.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                    const sel = document.querySelector(
+                      'input[name*="qty" i], input[name*="Qty" i], '
+                      + 'input[role="spinbutton"], input[aria-label*="수량"], '
+                      + 'div[class*="quantity" i] input, '
+                      + 'div[class*="Quantity" i] input'
+                    );
+                    if (!sel) return false;
+                    setVal(sel, qty);
+                    return true;
+                }""",
+                qty,
+            )
+            return bool(ok)
+        except Exception as exc:
+            log.debug(f"수량 JS fallback 실패: {exc}")
+            return False
 
     async def _click_buy_now(self, page: Page) -> None:
         # 0) 옵션 있는 상품 대응 — "선택한 옵션 추가하기" 버튼이 있으면 먼저 클릭.
