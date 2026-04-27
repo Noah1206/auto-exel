@@ -947,14 +947,10 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------
 
     def _on_cell_double_clicked(self, index) -> None:
-        """더블클릭 동작을 셀 편집 기본으로 두되, '상태' 컬럼 더블클릭만
-        단건 주문 실행 진입점으로 사용한다. (데이터 컬럼은 편집이 시작됨)
+        """행의 어느 셀이든 더블클릭하면 그 행의 단건 주문을 시작한다.
+        편집은 비활성화되어 있어서 충돌 없음.
         """
-        # 상태 컬럼인지 판정 — 다른 컬럼은 ExcelTableView 가 편집을 시작한다.
-        col_name = self.model.headerData(
-            index.column(), Qt.Horizontal, Qt.DisplayRole
-        )
-        if col_name != "상태":
+        if not index.isValid():
             return
         self._start_single_order_for_row(index.row())
 
