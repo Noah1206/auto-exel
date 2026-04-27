@@ -988,6 +988,11 @@ class MainWindow(QMainWindow):
                 return
         if not self._try_acquire():
             return
+        # 즉각 시각 피드백: 더블클릭 직후 행 상태를 '진행중' 으로 변경 → 스피너 회전
+        order.status = "in_progress"
+        order.error_message = None
+        self.model.update_order(order)
+        self.statusBar().showMessage(f"행 {order.row} 주문 시작 중...", 3000)
         # 단건 주문도 가격 가드 적용
         self._run_async(self._run_single_order_with_guard(order))
 

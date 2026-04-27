@@ -8,8 +8,8 @@ browser:
     height: 900
   locale: ko-KR
   timezone: Asia/Seoul
-  default_timeout_ms: 15000
-  navigation_timeout_ms: 30000
+  default_timeout_ms: 8000
+  navigation_timeout_ms: 15000
 automation:
   typing_delay_ms: 0
   retry_attempts: 2
@@ -17,15 +17,15 @@ automation:
   auto_click_final_payment: false
   skip_on_error: true
   skip_on_pause: true
-  inter_order_delay_ms: 300
+  inter_order_delay_ms: 200
   screenshot_on_error: true
   stealth_enabled: true
   verify_shopback: true
   abort_if_no_shopback: false
 price_scraper:
-  concurrent: 1
-  per_product_timeout_ms: 8000
-  inter_request_delay_ms: 800
+  concurrent: 5
+  per_product_timeout_ms: 6000
+  inter_request_delay_ms: 200
 excel:
   auto_save: true
   backup_on_load: true

@@ -1234,7 +1234,7 @@ class OrderAutomation:
 
         # 통관번호 조회 결과 등 비동기 갱신 대기 후 재시도 (최대 3회)
         for attempt in range(3):
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.3)
             if await _try_once():
                 return
             log.debug(f"영문이름 재시도 {attempt + 1}/3")
