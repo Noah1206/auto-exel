@@ -42,6 +42,7 @@ _ORDER_FIELD_BY_COL = {
     "구매처": "product_url",
     "수취인": "name",
     "수취인번호": "phone",
+    "수취인번호.1": "phone2",
     "통관번호": "customs_id",
     "우편번호": "postal_code",
     "수취인 주소": "address",

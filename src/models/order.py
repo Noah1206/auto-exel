@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.utils.validators import (
     clean_recipient_name,
@@ -117,6 +117,13 @@ class Order(BaseModel):
     @classmethod
     def _v_qty(cls, v) -> int:
         return validate_quantity(v)
+
+    @model_validator(mode="after")
+    def _fill_phone2_from_phone(self) -> "Order":
+        """수취인번호.1 이 비어 있으면 수취인번호 와 동일하게 자동 채움."""
+        if not self.phone2 and self.phone:
+            self.phone2 = self.phone
+        return self
 
     def compute_total(self) -> int | None:
         """'토탈가격' 컬럼에는 단가를 그대로 저장한다 (수량 곱셈 안 함)."""

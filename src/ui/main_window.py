@@ -802,23 +802,41 @@ class MainWindow(QMainWindow):
 
     def _on_install_shopback(self) -> None:
         """샵백 확장프로그램 설치 페이지를 앱 브라우저에서 연다."""
+        log.info("샵백 설치 버튼 클릭됨 → 처리 시작")
         if not self._try_acquire():
+            log.warning("샵백 설치: lock 획득 실패 (다른 작업 진행 중)")
+            self.statusBar().showMessage(
+                "다른 작업이 진행 중이라 샵백 설치 페이지를 열 수 없습니다", 4000
+            )
             return
         self._run_async(self._install_shopback_async())
 
     async def _install_shopback_async(self) -> None:
         try:
+            log.info("샵백: 브라우저 시작 시도")
             await self.browser.start()
-            await self.browser.show_window()
+            log.info("샵백: 브라우저 시작 완료 → 창 표시")
+            try:
+                await self.browser.show_window()
+            except Exception as exc:
+                log.warning(f"샵백: show_window 실패 (계속 진행): {exc}")
+            log.info("샵백: 확장프로그램 페이지 열기")
             await self.browser.open_extensions_page()
             self._ui(lambda: self.statusBar().showMessage(
                 "샵백 페이지를 열었습니다 — 'Chrome에 추가' 를 눌러 설치하세요", 8000
             ))
             log.info("샵백 확장프로그램 설치 페이지 열림")
         except AppError as exc:
-            log.error(f"샵백 설치 페이지 열기 실패: {exc}")
+            log.error(f"샵백 설치 페이지 열기 실패 (AppError): {exc}")
             await self._show_info_async(
                 "샵백 설치 페이지 열기 실패", str(exc), icon="critical"
+            )
+        except Exception as exc:
+            log.exception(f"샵백 설치 페이지 열기 실패 (예상치 못한 오류): {exc}")
+            await self._show_info_async(
+                "샵백 설치 페이지 열기 실패",
+                f"{type(exc).__name__}: {exc}",
+                icon="critical",
             )
 
     def _on_toggle_start_stop(self) -> None:

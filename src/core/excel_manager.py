@@ -236,6 +236,9 @@ class ExcelManager:
                 out[col_name] = str(int(v))
             else:
                 out[col_name] = str(v).strip()
+        # '수취인번호.1' 가 비어 있으면 '수취인번호' 와 동일하게 채움.
+        if not out.get("수취인번호.1") and out.get("수취인번호"):
+            out["수취인번호.1"] = out["수취인번호"]
         return out
 
     def _extract_total_price(
@@ -393,12 +396,17 @@ class ExcelManager:
         return out
 
     def _row_values(self, item: RowItem) -> list:
-        """Order 또는 RawRow 를 출력 컬럼 순서대로 값 리스트로 변환."""
+        """Order 또는 RawRow 를 출력 컬럼 순서대로 값 리스트로 변환.
+
+        '수취인번호.1' 가 비어 있으면 '수취인번호' 와 동일한 값으로 채워서 저장한다.
+        """
         if isinstance(item, Order):
+            phone2 = item.phone2 or item.phone
             return [
                 item.product_url,
                 item.name,
                 item.phone,
+                phone2,
                 item.customs_id,
                 item.postal_code,
                 item.address,
@@ -408,10 +416,13 @@ class ExcelManager:
                 item.order_number or "",
             ]
         # RawRow
+        phone1 = item.get("수취인번호")
+        phone2 = item.get("수취인번호.1") or phone1
         return [
             item.get("구매처"),
             item.get("수취인"),
-            item.get("수취인번호"),
+            phone1,
+            phone2,
             item.get("통관번호"),
             item.get("우편번호"),
             item.get("수취인 주소"),
