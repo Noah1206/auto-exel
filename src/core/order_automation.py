@@ -174,17 +174,66 @@ class OrderAutomation:
                 continue
         return current_page
 
-    async def _await_user_fill(self, row: int, timeout_sec: int = 1800) -> None:
-        """행에 대해 사용자가 '기입' 누를 때까지 대기 (최대 30분).
+    async def _await_user_fill(
+        self, row: int, page: Page | None = None, timeout_sec: int = 1800
+    ) -> None:
+        """다음 두 트리거 중 먼저 일어나는 쪽까지 대기:
+          1) 사용자가 메인 프로그램의 '기입' 버튼 클릭 → signal_fill(row)
+          2) 자동 감지: Chrome 에서 '구매하기' 누르면 주문서 페이지(/pay/...) 가 뜸
+             → 사용자가 따로 '기입' 안 눌러도 자동 진행
 
-        흐름: 자동화가 상품페이지에서 수량 변경 후 이 함수에서 멈춘다.
-        사용자가 직접 Chrome 의 '구매하기' 버튼을 누르고, 메인 프로그램의
-        '기입' 버튼을 누르면 트리거되어 주문서 입력으로 이어진다.
+        page 가 주어지면 그 page 의 context 의 모든 탭을 1초 간격으로 폴링해
+        주문서 URL 이 보이면 즉시 트리거 발동.
         """
         ev = asyncio.Event()
         self._fill_events[row] = ev
+
+        async def _wait_user() -> None:
+            await ev.wait()
+
+        async def _wait_order_page() -> None:
+            if page is None:
+                # 폴링할 page 가 없으면 그냥 user 만 대기
+                await asyncio.Event().wait()
+                return
+            try:
+                ctx = page.context
+            except Exception:
+                await asyncio.Event().wait()
+                return
+            poll = 1.0
+            while True:
+                try:
+                    for p in ctx.pages:
+                        if p.is_closed():
+                            continue
+                        url = p.url or ""
+                        if (
+                            "/pay/" in url
+                            or "OrderInfoAction" in url
+                            or "orderInfo" in url.lower()
+                        ):
+                            log.info(
+                                f"행{row}: 주문서 페이지 자동 감지 → '기입' 자동 트리거 ({url[:80]})"
+                            )
+                            return
+                except Exception:
+                    pass
+                await asyncio.sleep(poll)
+
         try:
-            await asyncio.wait_for(ev.wait(), timeout=timeout_sec)
+            user_task = asyncio.create_task(_wait_user())
+            page_task = asyncio.create_task(_wait_order_page())
+            done, pending = await asyncio.wait(
+                {user_task, page_task},
+                timeout=timeout_sec,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            if not done:
+                # timeout
+                raise asyncio.TimeoutError("기입 대기 타임아웃")
         finally:
             self._fill_events.pop(row, None)
 
@@ -425,9 +474,9 @@ class OrderAutomation:
                 self._emit(
                     order,
                     OrderState.CLICK_BUY,
-                    "Chrome 에서 '구매하기' 를 누른 뒤 상태칸의 '📝 기입' 버튼을 눌러주세요",
+                    "Chrome 에서 '구매하기' 를 누르면 자동으로 주문서 입력이 시작됩니다",
                 )
-                await self._await_user_fill(order.row)
+                await self._await_user_fill(order.row, page=page)
                 if page.is_closed():
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
