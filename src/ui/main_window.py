@@ -992,20 +992,26 @@ class MainWindow(QMainWindow):
         self._run_async(self._run_single_order_with_guard(order))
 
     async def _run_single_order_with_guard(self, order: Order) -> None:
+        # 토탈가격이 비어있으면 묻지 말고 바로 조회 진행
+        # (어차피 가격 없이는 주문 못 함, 모달이 화면에 안 뜨면 무한 대기됨)
         if order.needs_price():
-            yes = await self._ask_yesno_async(
-                "토탈가격 누락",
-                f"행 {order.row}의 토탈가격이 비어있습니다.\n가격을 먼저 조회할까요?",
+            log.info(
+                f"행 {order.row}: 토탈가격 누락 → 가격 자동 조회 후 주문 진행"
             )
-            if yes:
-                ok = await self._scrape_prices_async(only_missing=True)
-                if not ok:
-                    return
-                # 스크랩 후 동일 행의 최신 Order 다시 찾기
-                for r in self.model.all_rows():
-                    if isinstance(r, Order) and r.row == order.row:
-                        order = r
-                        break
+            self._ui(lambda: self.statusBar().showMessage(
+                f"행 {order.row} 가격 조회 중... (잠시 후 자동으로 주문 진행)"
+            ))
+            ok = await self._scrape_prices_async(only_missing=True, targets=[order])
+            if not ok:
+                self._ui(lambda: self.statusBar().showMessage(
+                    f"행 {order.row} 가격 조회 실패 — 주문 취소됨", 5000
+                ))
+                return
+            # 스크랩 후 동일 행의 최신 Order 다시 찾기
+            for r in self.model.all_rows():
+                if isinstance(r, Order) and r.row == order.row:
+                    order = r
+                    break
         await self._execute_order_async(order)
 
     def _on_start_all_orders(self) -> None:
