@@ -405,19 +405,34 @@ class OrderAutomation:
                     OrderState.SELECT_QUANTITY,
                     f"옵션 선택 대기 중... 옵션을 고르면 수량 {order.quantity} 로 자동 조정",
                 )
-                await self._wait_option_then_set_quantity(page, order)
+                ok = await self._wait_option_then_set_quantity(page, order)
+                if not ok or page.is_closed():
+                    raise UserInterventionRequired(
+                        "사용자가 페이지를 닫아 행을 종료했습니다.",
+                        checkpoint=Checkpoint.START.value,
+                    )
 
                 self._checkpoints[order.row] = Checkpoint.AT_PRODUCT_PAGE
                 cp = Checkpoint.AT_PRODUCT_PAGE
 
             # 2) 사용자가 직접 '구매하기' 누르고 '기입' 버튼 클릭 대기
             if cp == Checkpoint.AT_PRODUCT_PAGE:
+                if page.is_closed():
+                    raise UserInterventionRequired(
+                        "사용자가 페이지를 닫아 행을 종료했습니다.",
+                        checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                    )
                 self._emit(
                     order,
                     OrderState.CLICK_BUY,
                     "Chrome 에서 '구매하기' 를 누른 뒤 상태칸의 '📝 기입' 버튼을 눌러주세요",
                 )
                 await self._await_user_fill(order.row)
+                if page.is_closed():
+                    raise UserInterventionRequired(
+                        "사용자가 페이지를 닫아 행을 종료했습니다.",
+                        checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                    )
                 self._checkpoints[order.row] = Checkpoint.AT_ORDER_PAGE
                 cp = Checkpoint.AT_ORDER_PAGE
 
@@ -551,18 +566,16 @@ class OrderAutomation:
 
     async def _wait_option_then_set_quantity(
         self, page: Page, order: Order, timeout_sec: int = 1800
-    ) -> None:
+    ) -> bool:
         """사용자가 옵션을 선택해서 사이드바에 추가될 때까지 대기.
 
-        그 후 사이드바의 +/- 버튼 또는 수량 input 으로 수량을 order.quantity 로 조정.
-
-        - 옵션이 없는 단일 상품(이미 사이드바에 떠 있음) 이면 즉시 수량 조정.
-        - 옵션이 있는 상품은 사용자가 선택할 때까지 0.5초 간격으로 폴링.
-        - 페이지가 닫히거나 timeout 초과 시 그냥 진행 (다음 단계가 알아서 처리).
+        반환:
+          True  — 옵션 감지 후 수량 조정 성공
+          False — 페이지 닫힘 / 타임아웃 → 호출자가 빠르게 종료해야 함
         """
         qty = order.quantity
         if qty <= 0:
-            return
+            return True
 
         elapsed = 0.0
         poll = 0.5
@@ -570,30 +583,30 @@ class OrderAutomation:
 
         while elapsed < timeout_sec:
             if page.is_closed():
-                log.info(f"행{order.row}: 페이지 닫힘 → 옵션 대기 종료")
-                return
+                log.info(
+                    f"행{order.row}: 페이지 닫힘 → 옵션 대기 종료 (행 종료)"
+                )
+                return False
             try:
                 cur = await self._read_current_quantity(page)
             except Exception:
                 cur = None
             if cur is not None:
-                # 사이드바/수량 input 이 활성 = 옵션이 추가된 상태
                 sidebar_seen = True
                 log.info(
                     f"행{order.row}: 옵션 감지됨 (현재 수량={cur}) → "
                     f"{qty} 로 조정 시도"
                 )
-                # 수량 조정
                 await self._select_quantity(page, order)
-                return
+                return True
             await asyncio.sleep(poll)
             elapsed += poll
 
         if not sidebar_seen:
             log.warning(
-                f"행{order.row}: 옵션 대기 타임아웃 ({timeout_sec}s) — "
-                "사용자가 옵션을 선택하지 않음. 다음 단계로 진행"
+                f"행{order.row}: 옵션 대기 타임아웃 ({timeout_sec}s)"
             )
+        return False
 
     async def _select_quantity(self, page: Page, order: Order) -> None:
         """수량을 order.quantity 만큼 맞춘다. 4가지 UI 패턴 지원:
