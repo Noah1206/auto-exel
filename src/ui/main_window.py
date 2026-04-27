@@ -1845,14 +1845,46 @@ class MainWindow(QMainWindow):
         return fut
 
     def _try_acquire(self) -> bool:
-        """동시 실행 방지. True 면 이번 작업 시작 가능, False 면 거절."""
+        """동시 실행 방지. True 면 이번 작업 시작 가능, False 면 거절.
+
+        실제로 실행 중인 future 가 없는데도 _busy=True 인 경우
+        (콜백이 어떤 이유로 호출 못 된 경우) 자동으로 해제한다.
+        """
         if self._busy:
-            QMessageBox.warning(
-                self,
-                "이미 진행 중",
-                "다른 자동화 작업이 이미 실행 중입니다. 끝난 후 다시 시도해 주세요.",
-            )
-            return False
+            # 자동 복구: 실제 실행 중인 future 가 없으면 stale lock 으로 간주
+            cur = getattr(self, "_current_future", None)
+            stale = cur is None or cur.done()
+            if stale:
+                log.warning(
+                    "_busy 가 True 인데 실행 중인 future 가 없음 → 자동 해제 (stale lock 복구)"
+                )
+                self._busy = False
+                self._current_future = None
+                # 버튼 상태도 함께 복구
+                try:
+                    self._set_orders_button_running(False)
+                except Exception:
+                    pass
+            else:
+                reply = QMessageBox.question(
+                    self,
+                    "이미 진행 중",
+                    "다른 자동화 작업이 이미 실행 중입니다.\n"
+                    "그래도 강제로 시작하시겠습니까?\n\n"
+                    "(현재 실행 중인 작업이 멈춰있다면 '예' 를 눌러 강제 시작)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return False
+                # 강제 해제 후 진행
+                log.warning("사용자가 강제로 _busy lock 을 해제하고 새 작업 시작")
+                self._busy = False
+                self._current_future = None
+                try:
+                    self._set_orders_button_running(False)
+                except Exception:
+                    pass
         self._busy = True
         return True
 
