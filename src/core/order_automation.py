@@ -154,25 +154,60 @@ class OrderAutomation:
             self._next_events.pop(row, None)
 
     async def _switch_to_order_page(self, current_page: Page) -> Page:
-        """현재 컨텍스트의 모든 탭에서 주문서 URL(/pay/...) 인 탭을 찾아 반환.
+        """현재 행의 탭이 '구매하기' 클릭으로 주문서로 navigate 됐거나
+        opener=current_page 인 새 탭이 열린 경우, 그 탭을 반환.
 
-        사용자가 '구매하기' 누르면 새 탭이 열릴 수도, 기존 탭이 navigate 될 수도 있다.
-        주문서 페이지가 안 보이면 current_page 를 그대로 반환.
+        병렬 진행 안전: 다른 행이 점유 중인(_pages 에 등록된) 탭은 절대 반환 안 함.
+        opener 정보로 '이 current_page 가 직접 연 탭' 만 후보로 삼는다.
         """
+        # 1) current_page 자체가 이미 주문서로 navigate 됐으면 그대로 사용
+        try:
+            url = current_page.url or ""
+            if (
+                "/pay/" in url or "OrderInfoAction" in url
+                or "orderinfo" in url.lower()
+            ):
+                return current_page
+        except Exception:
+            pass
+
+        # 2) 다른 행이 점유 중인 탭 집합 (병렬 진행 보호)
+        owned_pages = set()
+        for r, p in self._pages.items():
+            if p is not None and p is not current_page:
+                owned_pages.add(p)
+
+        # 3) ctx 의 페이지들 중 'current_page 가 opener' 이면서 주문서 URL 인 것
         try:
             ctx = current_page.context
         except Exception:
             return current_page
         for p in ctx.pages:
             try:
-                if p.is_closed():
+                if p is current_page or p.is_closed():
                     continue
-                url = p.url or ""
-                # 11번가 주문서 URL 패턴
-                if "/pay/" in url or "OrderInfoAction" in url or "orderInfo" in url.lower():
+                if p in owned_pages:
+                    continue  # 다른 행 소유 → 건너뜀
+                # opener 검사 — current_page 가 직접 연 popup/새 탭만 인정
+                try:
+                    opener = await p.opener()
+                except Exception:
+                    opener = None
+                if opener is not current_page:
+                    continue
+                purl = p.url or ""
+                if (
+                    "/pay/" in purl or "OrderInfoAction" in purl
+                    or "orderinfo" in purl.lower()
+                ):
+                    log.info(
+                        f"_switch_to_order_page: opener 일치하는 새 주문서 탭 발견 "
+                        f"({purl[:80]})"
+                    )
                     return p
             except Exception:
                 continue
+        # 못 찾으면 current_page 그대로 (호출자가 적절히 처리)
         return current_page
 
     async def _await_user_fill(
