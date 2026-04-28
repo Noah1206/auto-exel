@@ -2631,8 +2631,14 @@ class OrderAutomation:
       value: el.value || '',
       type: type,
     };
-    const hay = Object.values(info).join(' ').toLowerCase();
-    const isMatch = /prsn.*cstms|cstms.*cd|prsncstms|customs|통관|개인통관|통관고유|p로\s*시작|13자리/i.test(hay);
+    // 매칭은 필드 자체 메타(name/id/placeholder/aria/label) 로만 — 'near'(섹션 heading)
+    // 까지 보면 같은 '개인통관고유부호' 섹션 안의 영문이름/주민번호 칸까지
+    // 통관번호로 덮어버리는 사고 발생. near 는 디버그용으로만 표시.
+    const fieldHay = [info.name, info.id, info.placeholder, info.aria, info.label]
+      .join(' ').toLowerCase();
+    // 명시적 제외: 이름/주민/사업자 필드는 절대 통관번호로 덮지 않음
+    const exclude = /ordengnm|ordnm|ordrsdnt|bizno|english|name|주민|사업자|영문/i;
+    const isMatch = !exclude.test(fieldHay) && /prsn.*cstms|cstms.*cd|prsncstms|customs|통관|개인통관|통관고유|psncscuniqno/i.test(fieldHay);
     debug.push({...info, matched: isMatch});
     if (!isMatch) continue;
 
