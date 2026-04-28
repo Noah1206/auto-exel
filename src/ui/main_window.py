@@ -184,23 +184,13 @@ class MainWindow(QMainWindow):
         self.table.setItemDelegate(self._cell_editor_delegate)
 
         # 상태 컬럼에 pill + 스피너 delegate 설치 (기본 delegate 를 덮어씀)
+        # '다음으로/주문번호 가져오기' 단계 제거 — 결제 완료시 자동 감지/추출.
+        # StatusDelegate 가 콜백을 요구하므로 stub 전달.
         def _is_awaiting_next(idx) -> bool:
-            order = self._order_for_index(idx)
-            if order is None or self.automation is None:
-                return False
-            try:
-                return self.automation.is_awaiting_next(order.row)
-            except Exception:
-                return False
+            return False
 
         def _on_next(idx) -> None:
-            order = self._order_for_index(idx)
-            if order is None or self.automation is None:
-                return
-            self.automation.signal_next(order.row)
-            self.statusBar().showMessage(
-                f"행 {order.row}: '다음으로' 신호 전송 — 주문번호 추출 중...", 4000
-            )
+            pass
 
         def _is_awaiting_fill(idx) -> bool:
             order = self._order_for_index(idx)
@@ -440,13 +430,6 @@ class MainWindow(QMainWindow):
         )
         self.action_fill.triggered.connect(self._on_fill_clicked_toolbar)
 
-        # 주문번호 가져오기 — 결제 완료 후 주문번호 추출 트리거
-        self.action_next = QAction("주문번호 가져오기", self)
-        self.action_next.setToolTip(
-            "결제 완료 페이지에서 주문번호를 추출해 엑셀에 저장합니다"
-        )
-        self.action_next.triggered.connect(self._on_next_clicked_toolbar)
-
         # 주문하기 / 중단하기 토글 — 한 버튼이 상태에 따라 역할 전환
         self.action_start_orders = QAction("주문하기", self)
         self.action_start_orders.setShortcut(QKeySequence("Ctrl+R"))
@@ -482,7 +465,6 @@ class MainWindow(QMainWindow):
         tb.addAction(self.action_save_original)  # 원본에 저장
         tb.addAction(self.action_scrape)         # 가격 조회
         tb.addAction(self.action_fill)           # 기입 (모든 필드 한 번에)
-        tb.addAction(self.action_next)           # 주문번호 가져오기 (결제 후)
 
         # 초기: 엑셀 미로드 상태이므로 툴바 숨김
         tb.setVisible(False)
@@ -951,37 +933,6 @@ class MainWindow(QMainWindow):
             f"행 {rows_str}: '기입' 신호 전송 — 주문서 자동 입력 중...", 4000
         )
         log.info(f"툴바 기입 클릭 → 행 {rows_str} 에 신호 전송")
-
-    def _on_next_clicked_toolbar(self) -> None:
-        """툴바 '주문번호 가져오기' 버튼 — 결제 완료 후 주문번호 추출 신호 전송."""
-        if self.automation is None:
-            self.statusBar().showMessage(
-                "주문이 시작된 행이 없습니다", 4000,
-            )
-            return
-        selected = self._selected_orders()
-        targets = [
-            o for o in selected
-            if self.automation.is_awaiting_next(o.row)
-        ]
-        if not targets:
-            for r in self.model.all_rows():
-                if isinstance(r, Order) and self.automation.is_awaiting_next(r.row):
-                    targets.append(r)
-        if not targets:
-            self.statusBar().showMessage(
-                "주문번호 추출 대기 중인 행이 없습니다 (결제 완료 후 사용 가능)",
-                4000,
-            )
-            return
-        for o in targets:
-            self.automation.signal_next(o.row)
-        rows_str = ", ".join(str(o.row) for o in targets)
-        self.statusBar().showMessage(
-            f"행 {rows_str}: '다음으로' 신호 전송 — 주문번호 추출 중...",
-            4000,
-        )
-        log.info(f"툴바 주문번호 가져오기 클릭 → 행 {rows_str} 에 신호 전송")
 
     def _on_scrape_prices(self) -> None:
         if self.excel_mgr is None or not self.model.all_rows():
@@ -1648,19 +1599,6 @@ class MainWindow(QMainWindow):
         order = item
         menu = QMenu(self)
 
-        # "다음으로" — 결제 후 사용자가 트리거하는 액션.
-        # automation 에서 해당 행이 사용자 트리거를 기다리는 중일 때만 노출.
-        next_action = None
-        if (
-            self.automation
-            and getattr(self.automation, "is_awaiting_next", None)
-            and self.automation.is_awaiting_next(order.row)
-        ):
-            next_action = menu.addAction(
-                "\u25B6 다음으로 (결제 완료 → 주문번호 저장)"
-            )
-            menu.addSeparator()
-
         resume_action = None
         if order.status in ("paused", "failed") and self.automation and self.automation.has_active_page(order):
             resume_action = menu.addAction("\u25B7 이어서 진행 (브라우저에서 수정 완료 후)")
@@ -1696,13 +1634,7 @@ class MainWindow(QMainWindow):
         view_screenshot.setEnabled(bool(order.screenshot_path))
 
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if next_action and action is next_action:
-            if self.automation:
-                self.automation.signal_next(order.row)
-                self.statusBar().showMessage(
-                    f"행 {order.row}: '다음으로' 신호 전송 — 주문번호 추출 중...", 4000
-                )
-        elif resume_action and action is resume_action:
+        if resume_action and action is resume_action:
             self._run_async(self._resume_order_async(order))
         elif refill_action and action is refill_action:
             self._run_async(self._refill_order_async(order))
