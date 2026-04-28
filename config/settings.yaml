@@ -43,8 +43,12 @@ ui:
   show_empty_state_help: true
   shopback_install_prompted: true
   recent_excel_files:
-  - /Users/johyeon-ung/Downloads/원본+11마존+주문전송_완료_20260427_150506_완료_20260427_165216.xlsx
-  - /Users/johyeon-ung/Downloads/0.11마존+주문전송_완료_20260426_071902.xlsx
+  - /Users/johyeon-ung/Downloads/0.11마존+주문전송 (1).xlsx
   - /Users/johyeon-ung/Downloads/0.11마존+주문전송.xlsx
+  - /Users/johyeon-ung/Downloads/0.11마존+주문전송_완료_20260426_071902.xlsx
+  - /Users/johyeon-ung/Downloads/원본+11마존+주문전송_완료_20260427_150506.xlsx
+  - /Users/johyeon-ung/Downloads/원본+11마존+주문전송_완료_20260427_150506_완료_20260427_165216.xlsx
+  - /Users/johyeon-ung/Downloads/원본+11마존+주문전송_완료_20260427_150506_완료_20260427_165216_완료_20260428_122711.xlsx
+  - /Users/johyeon-ung/Downloads/원본+11마존+주문전송_완료_20260427_150506_완료_20260427_165117.xlsx
   - /Users/johyeon-ung/Downloads/0.11마존+주문전송_완료_20260425_001613.xlsx
   recent_excel_max: 10

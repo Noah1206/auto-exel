@@ -1337,7 +1337,8 @@ class MainWindow(QMainWindow):
                         f"행{order.row} 일시정지 — 사용자 수정 후 '이어서 진행' 필요. 전체 진행 중단."
                     )
                     break
-            elif order.status in ("failed", "unavailable"):
+            elif order.status in ("failed", "unavailable", "pending"):
+                # pending: 실패 후 자동 복귀된 상태 (재시도 가능). batch 에선 건너뜀 처리.
                 if skip_on_error:
                     log.info(f"행{order.row} {order.status} → 다음 행으로 건너뜁니다")
                     skipped_count += 1

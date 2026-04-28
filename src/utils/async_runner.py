@@ -52,7 +52,18 @@ class AsyncRunner:
         log.info(f"{self._name} 시작")
 
     def _run(self) -> None:
-        self._loop = asyncio.new_event_loop()
+        # Windows: subprocess(PowerShell 창 이동 등) 가 SelectorEventLoop 에선
+        # NotImplementedError 로 터진다. ProactorEventLoop 를 명시 보장.
+        # Python 3.8+ 의 Windows 기본은 Proactor 이지만 일부 패키지/플러그인이
+        # SelectorEventLoopPolicy 를 전역으로 깔아둘 수 있어 방어적으로 강제.
+        import sys as _sys
+        if _sys.platform == "win32":
+            try:
+                self._loop = asyncio.ProactorEventLoop()
+            except Exception:
+                self._loop = asyncio.new_event_loop()
+        else:
+            self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._ready.set()
         try:

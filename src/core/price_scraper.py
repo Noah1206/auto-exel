@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import re
+import urllib.error
+import urllib.request
+import zlib
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +28,38 @@ log = get_logger()
 
 # 진행 상황 콜백: (current, total, order) → None
 ProgressCb = Callable[[int, int, Order], None]
+
+# HTTP fast path 용 — Playwright/Chrome 안 띄우고 가격 추출. 17건 ≈ 1초.
+# Chrome 시동/탭 생성 비용이 항목당 1~2초인데 이게 통째로 사라진다.
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+}
+
+# HTML 텍스트에서 가격 직접 추출용 정규식 시퀀스. 우선순위 순서.
+# 11번가 상품 페이지 SSR HTML 에 그대로 들어있는 패턴들.
+_PRICE_HTML_PATTERNS = (
+    # itemprop="price" content="50000"
+    re.compile(r'itemprop=["\']price["\'][^>]*content=["\'](\d{3,9})["\']', re.IGNORECASE),
+    re.compile(r'content=["\'](\d{3,9})["\'][^>]*itemprop=["\']price["\']', re.IGNORECASE),
+    # data-finalprc="50000" 등
+    re.compile(r'data-final[-_]?pr[ci]e?=["\'](\d{3,9})["\']', re.IGNORECASE),
+    re.compile(r'data-sell[-_]?pr[ci]e?=["\'](\d{3,9})["\']', re.IGNORECASE),
+    # JSON 안 finalPrc / sellPrc / lastPrc 키
+    re.compile(r'"(?:finalPrc|sellPrc|lastPrc|finalPrice|sellPrice)"\s*:\s*"?(\d{3,9})"?'),
+    # <strong class="...price..."> 50,000 </strong>
+    re.compile(
+        r'<strong[^>]*class=["\'][^"\']*(?:c_product_detail__price|SellPrice|price-value)[^"\']*["\'][^>]*>'
+        r'\s*([\d,]{3,12})\s*(?:원)?\s*</strong>',
+        re.IGNORECASE,
+    ),
+)
 
 
 class PriceScraper:
@@ -76,34 +113,55 @@ class PriceScraper:
             async with sem:
                 if self._cancel:
                     return
-                # 각 워커는 자기 전용 페이지 사용 (동시성 안전)
                 page = None
                 try:
-                    page = await self.browser.new_page()
+                    # ★ Fast path: HTTP 직접 요청. Chrome/Playwright 안 띄움.
+                    #    SSR HTML 에 가격이 들어있어 대부분 여기서 끝남.
+                    unit: int | None = None
+                    fast_unavail = False
                     try:
-                        unit = await self._scrape_one(page, order)
+                        unit, fast_unavail = await self._scrape_via_http(order)
+                    except Exception as exc:
+                        log.debug(f"행{order.row} HTTP fast path 예외: {exc}")
+                        unit, fast_unavail = None, False
+
+                    if fast_unavail:
+                        order.status = "unavailable"
+                        order.error_message = "페이지 없음 (HTTP 404)"
+                        log.warning(f"[{idx}/{total}] 행{order.row} HTTP 404 (fast)")
+                    elif unit is not None:
                         order.unit_price = unit
                         order.compute_total()
                         log.info(
                             f"[{idx}/{total}] 행{order.row} 단가: {unit:,}원 "
-                            f"× {order.quantity} = {order.total_price:,}원"
+                            f"× {order.quantity} = {order.total_price:,}원 (fast)"
                         )
-                    except ProductUnavailableError as exc:
-                        order.status = "unavailable"
-                        order.error_message = f"페이지 없음: {exc.reason}"
-                        log.warning(
-                            f"[{idx}/{total}] 행{order.row} HTTP 404 — {exc.reason}"
-                        )
-                    except Exception as exc:
-                        log.warning(
-                            f"[{idx}/{total}] 행{order.row} 가격 조회 실패: {exc}"
-                        )
-                        # 진단 파일은 첫 실패 / 10번째마다 1회만 저장 (디스크 절약)
-                        if idx == 1 or idx % 10 == 0:
-                            try:
-                                await self._save_diagnostics(page, order)
-                            except Exception:
-                                pass
+                    else:
+                        # Fallback: Playwright 경로 (셀렉터 깨졌거나 SSR 에 가격 없음)
+                        page = await self.browser.new_page()
+                        try:
+                            unit = await self._scrape_one(page, order)
+                            order.unit_price = unit
+                            order.compute_total()
+                            log.info(
+                                f"[{idx}/{total}] 행{order.row} 단가: {unit:,}원 "
+                                f"× {order.quantity} = {order.total_price:,}원"
+                            )
+                        except ProductUnavailableError as exc:
+                            order.status = "unavailable"
+                            order.error_message = f"페이지 없음: {exc.reason}"
+                            log.warning(
+                                f"[{idx}/{total}] 행{order.row} HTTP 404 — {exc.reason}"
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                f"[{idx}/{total}] 행{order.row} 가격 조회 실패: {exc}"
+                            )
+                            if idx == 1 or idx % 10 == 0:
+                                try:
+                                    await self._save_diagnostics(page, order)
+                                except Exception:
+                                    pass
                 finally:
                     if page is not None:
                         try:
@@ -138,6 +196,72 @@ class PriceScraper:
         """토탈가격이 비어있는 주문만 필터. 주문 시작 전 가드로 사용."""
         return [o for o in orders if o.needs_price()]
 
+    async def _scrape_via_http(self, order: Order) -> tuple[int | None, bool]:
+        """Chrome/Playwright 안 거치고 표준 라이브러리(urllib) 로 HTML 직접 GET.
+
+        반환: (unit_price | None, is_unavailable)
+          - 가격 추출 성공: (가격, False)
+          - 404 등 판매중지: (None, True)
+          - 그 외 실패(셀렉터 안 잡힘 등): (None, False)  → 호출자가 Playwright fallback
+
+        17건 ≈ 1초. Chrome 시동/탭 생성/렌더링 비용을 통째로 절약.
+        """
+        timeout_s = max(2.0, self.config.per_product_timeout_ms / 1000)
+
+        def _do_request() -> tuple[int | None, bool]:
+            req = urllib.request.Request(
+                order.product_url, headers=_HTTP_HEADERS, method="GET"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    raw = resp.read()
+                    enc = resp.headers.get("Content-Encoding", "").lower()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    return (None, True)
+                return (None, False)
+            except Exception:
+                return (None, False)
+
+            # gzip/deflate 디코딩
+            try:
+                if enc == "gzip":
+                    raw = gzip.decompress(raw)
+                elif enc == "deflate":
+                    raw = zlib.decompress(raw)
+            except Exception:
+                pass
+
+            # 한국어 페이지라 utf-8 우선, 실패 시 cp949
+            html: str
+            try:
+                html = raw.decode("utf-8", errors="replace")
+            except Exception:
+                try:
+                    html = raw.decode("cp949", errors="replace")
+                except Exception:
+                    return (None, False)
+
+            # 판매중지/페이지 없음 휴리스틱 — 11번가 SSR 에 자주 노출되는 문구
+            lowered = html[:20000]
+            if ("존재하지 않는 상품" in lowered
+                    or "삭제된 상품" in lowered
+                    or "판매가 종료" in lowered
+                    or "판매중지" in lowered):
+                return (None, True)
+
+            # 정규식 시퀀스로 가격 추출
+            for pat in _PRICE_HTML_PATTERNS:
+                m = pat.search(html)
+                if not m:
+                    continue
+                v = clean_price(m.group(1))
+                if v and v > 0:
+                    return (v, False)
+            return (None, False)
+
+        return await asyncio.to_thread(_do_request)
+
     async def _save_diagnostics(self, page, order: Order) -> None:
         """가격 조회 실패 시 진단용 HTML/스크린샷 저장.
 
@@ -159,7 +283,13 @@ class PriceScraper:
             log.debug(f"진단 파일 저장 실패: {exc}")
 
     async def _scrape_one(self, page, order: Order) -> int:
+        # route 차단은 의도적으로 사용하지 않는다.
+        # 가격 fast path (HTTP) 가 대부분 처리하므로 fallback 자체가 드물고,
+        # 차단 시 macOS Chromium 의 disk cache 잔재로 다른 탭 페이지가
+        # 빈 박스(이미지 미로드)로 보이는 부작용이 관찰됨.
         try:
+            # domcontentloaded 까지 기다림 — DOM 트리가 만들어진 시점.
+            # 가격 셀렉터가 안전하게 매칭되려면 이 시점이 필요.
             response = await page.goto(
                 order.product_url,
                 wait_until="domcontentloaded",
@@ -171,7 +301,8 @@ class PriceScraper:
         # 0) 판매중지/삭제 감지 — 가격 추출 전에 먼저 확인
         await self._check_unavailability(page, response)
 
-        # 1) selectors.yaml 기반 시도
+        # 1) selectors.yaml 기반 시도 — 정상 케이스 99% 여기서 잡힘.
+        #    셀렉터로 잡힌 가격은 정확하므로 시간을 충분히 주는 게 안전.
         try:
             raw = await self.selectors.get_text(
                 page,
@@ -185,8 +316,8 @@ class PriceScraper:
         except ElementNotFoundError:
             pass  # fallback 으로 넘어감
 
-        # 2) JavaScript fallback: 페이지 DOM에서 "숫자+원" 패턴 요소를 찾아
-        #    가장 그럴듯한 가격을 추론한다. 11번가 DOM 개편에 영향받지 않는다.
+        # 2) JavaScript fallback — 셀렉터가 페이지 개편으로 깨진 케이스만.
+        #    여기 떨어졌다는 건 셀렉터 갱신이 필요하다는 신호.
         value = await self._fallback_price_from_dom(page)
         if value is None:
             raise ElementNotFoundError(
@@ -196,6 +327,7 @@ class PriceScraper:
             )
         log.info(f"행{order.row} 가격 fallback 추출 성공: {value:,}원")
         return value
+
 
     async def _check_unavailability(self, page, response) -> None:
         """페이지 자체가 사라졌는지만 본다 (HTTP 404).

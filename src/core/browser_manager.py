@@ -29,12 +29,31 @@ class BrowserManager:
 
     async def start(self) -> BrowserContext:
         if self._context is not None:
-            return self._context
+            if self._is_context_alive(self._context):
+                return self._context
+            # 사용자가 Chrome 창을 닫았거나 크래시 → 재시작해야 후속 주문이 살아남는다.
+            log.warning("이전 브라우저 컨텍스트가 닫혀있음 — 재시작합니다")
+            self._context = None
+            await self._safe_stop_playwright()
+            self._stealth = None
 
         profile = Path(self.config.profile_dir).absolute()
         profile.mkdir(parents=True, exist_ok=True)
 
         log.info(f"크롬 프로필: {profile}")
+
+        # 이전 Chrome 이 비정상 종료되면 SingletonLock(macOS/Linux) / lockfile(Windows)
+        # 가 남아 다음 launch 가 "profile is already in use" 로 실패한다.
+        # 자동 재시작 흐름에서 이게 항상 발목을 잡으니 stale lock 은 제거한다.
+        # 실행 중인 Chrome 이 있으면 잠금 파일이 즉시 다시 생성되므로 안전.
+        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+            try:
+                lock_path = profile / lock_name
+                if lock_path.exists() or lock_path.is_symlink():
+                    lock_path.unlink()
+                    log.info(f"이전 프로필 잠금 파일 제거: {lock_name}")
+            except Exception as exc:
+                log.debug(f"잠금 파일 제거 실패 ({lock_name}): {exc}")
 
         self._playwright = await async_playwright().start()
 
@@ -113,6 +132,12 @@ class BrowserManager:
         self._context.set_default_timeout(self.config.default_timeout_ms)
         self._context.set_default_navigation_timeout(self.config.navigation_timeout_ms)
 
+        # 컨텍스트가 닫히면(사용자 창 닫기/크래시) 즉시 핸들 비워 다음 start() 가 재시작하게 한다.
+        try:
+            self._context.on("close", self._on_context_closed)
+        except Exception as exc:
+            log.debug(f"context close 핸들러 등록 실패 (무시): {exc}")
+
         # stealth 초기화 (선택)
         if self.stealth_enabled:
             try:
@@ -129,6 +154,46 @@ class BrowserManager:
 
         log.info(f"브라우저 시작 완료: pages={len(self._context.pages)}")
         return self._context
+
+    @staticmethod
+    def _is_context_alive(ctx: BrowserContext) -> bool:
+        """컨텍스트(브라우저)가 아직 살아있는지 비파괴적으로 점검.
+
+        Playwright 의 닫힘 신호는 한 곳에서 깔끔하게 안 나와서 다중 체크:
+          1) 내부 _impl_obj._closed_or_closing (있으면) — 가장 빠름
+          2) browser.is_connected() — 브라우저 프로세스 단위
+          3) ctx.pages 길이 — 닫힌 persistent context 는 0 이거나 stale page
+             (단 이 판단만으로는 부족)
+          4) ctx.cookies(...) await 호출 — 가장 확실하지만 async 라 여기선 못 씀.
+
+        가짜 alive 보다는 가짜 dead 가 안전(재시작하면 그만). 한 신호라도 죽었다고
+        말하면 죽은 것으로 간주.
+        """
+        try:
+            # 1) Playwright 내부 플래그 — 가장 빠르고 정확
+            impl = getattr(ctx, "_impl_obj", None)
+            for attr in ("_closed_or_closing", "_closed", "_was_closed"):
+                if impl is not None and getattr(impl, attr, False):
+                    return False
+            # 2) 브라우저 연결 상태
+            browser = ctx.browser
+            if browser is not None:
+                try:
+                    if not browser.is_connected():
+                        return False
+                except Exception:
+                    return False
+            # 3) pages 접근 — 닫힌 ctx 에서 예외 또는 stale 반환 모두 처리
+            _ = ctx.pages
+            return True
+        except Exception:
+            return False
+
+    def _on_context_closed(self, *_args) -> None:
+        """Playwright 가 컨텍스트 close 이벤트를 발사하면 핸들을 비워준다."""
+        log.warning("브라우저 컨텍스트 close 이벤트 — 다음 주문에서 재시작 예정")
+        self._context = None
+        self._stealth = None
 
     async def close(self) -> None:
         if self._context is not None:
@@ -188,10 +253,14 @@ class BrowserManager:
         return self._context is not None
 
     async def _move_chrome_window(self, x: int, y: int) -> None:
-        """Chrome 창을 (x, y) 로 이동. macOS 는 osascript, Windows 는 PowerShell.
+        """Chrome 창을 (x, y) 로 이동. macOS 는 osascript, Windows 는 ctypes/PowerShell.
 
         포커스를 빼앗지 않도록 activate/frontmost 는 절대 호출하지 않는다.
         실패해도 silently 무시 — 창 이동은 best-effort.
+
+        Windows 는 ctypes(user32.dll) 직접 호출이 1순위. PowerShell 차단 환경
+        (ExecutionPolicy / ConstrainedLanguage / pwsh 만 설치됨) 모두 우회.
+        ctypes 도 실패하면 PowerShell fallback.
         """
         import asyncio as _asyncio
         try:
@@ -212,38 +281,189 @@ class BrowserManager:
                 )
                 await proc.wait()
             elif sys.platform == "win32":
-                # Windows: PowerShell + Win32 API 로 Chrome 창 이동.
-                # SW_SHOWNOACTIVATE(4) 로 포커스 빼앗지 않고 화면 안으로 이동.
-                # MoveWindow 로 좌표 변경. pywin32 의존성 없이 동작.
-                ps_script = (
-                    "$sig=@\"\n"
-                    "  [DllImport(\"user32.dll\")] public static extern bool MoveWindow(IntPtr hWnd,int X,int Y,int W,int H,bool R);\n"
-                    "  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd,int n);\n"
-                    "  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);\n"
-                    "  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd,out RECT r);\n"
-                    "  [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L;public int T;public int R;public int B;}\n"
-                    "\"@\n"
-                    "Add-Type -MemberDefinition $sig -Name W -Namespace U -UsingNamespace System.Runtime.InteropServices\n"
-                    "Get-Process chrome -ErrorAction SilentlyContinue | "
-                    "Where-Object {$_.MainWindowHandle -ne 0} | "
-                    "ForEach-Object {\n"
-                    f"  [U.W]::ShowWindow($_.MainWindowHandle, 4)\n"  # SW_SHOWNOACTIVATE
-                    f"  [U.W]::MoveWindow($_.MainWindowHandle, {x}, {y}, "
-                    f"{self.config.viewport.width}, {self.config.viewport.height}, $true)\n"
-                    "}"
-                )
-                proc = await _asyncio.create_subprocess_exec(
-                    "powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                    "-Command", ps_script,
-                    stdout=_asyncio.subprocess.DEVNULL,
-                    stderr=_asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
+                if await self._move_chrome_window_ctypes(x, y):
+                    return
+                log.debug("ctypes 창 이동 실패 → PowerShell fallback")
+                await self._move_chrome_window_powershell(x, y)
             else:
                 # Linux: 창 매니저별로 다르므로 no-op
                 return
         except Exception as exc:
             log.debug(f"창 위치 이동 실패: {exc}")
+
+    async def _move_chrome_window_ctypes(self, x: int, y: int) -> bool:
+        """ctypes 로 user32.dll 직접 호출 — PowerShell 차단 환경 우회.
+
+        MainWindowHandle 이 아직 만들어지지 않은 타이밍 보호를 위해 0.1s 간격 3회 retry.
+        Chrome 프로세스 PID 매칭으로 다른 사용자 Chrome 창은 건드리지 않는다.
+        """
+        import asyncio as _asyncio
+
+        def _do_move() -> bool:
+            try:
+                import ctypes
+                from ctypes import wintypes
+            except Exception:
+                return False
+            try:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+            except Exception:
+                return False
+
+            # 시그니처 정의
+            EnumWindows = user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+            )
+            EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+            EnumWindows.restype = wintypes.BOOL
+
+            GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+            GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+            ]
+            GetWindowThreadProcessId.restype = wintypes.DWORD
+
+            IsWindowVisible = user32.IsWindowVisible
+            IsWindowVisible.argtypes = [wintypes.HWND]
+            IsWindowVisible.restype = wintypes.BOOL
+
+            GetWindowTextLengthW = user32.GetWindowTextLengthW
+            GetWindowTextLengthW.argtypes = [wintypes.HWND]
+            GetWindowTextLengthW.restype = ctypes.c_int
+
+            ShowWindow = user32.ShowWindow
+            ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            ShowWindow.restype = wintypes.BOOL
+
+            MoveWindow = user32.MoveWindow
+            MoveWindow.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.BOOL,
+            ]
+            MoveWindow.restype = wintypes.BOOL
+
+            SW_SHOWNOACTIVATE = 4
+            target_pids: set[int] = set()
+
+            # Chrome 프로세스 PID 수집 — Playwright 로 띄운 우리 Chrome 만 노린다.
+            # ctx.browser._impl_obj 에서 직접 얻기 어려우니, image name 로
+            # tasklist 대신 ctypes 로 모든 chrome.exe PID 를 잡는다.
+            try:
+                # toolhelp32 로 PID 수집
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                TH32CS_SNAPPROCESS = 0x00000002
+                INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+                class PROCESSENTRY32W(ctypes.Structure):
+                    _fields_ = [
+                        ("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_void_p),
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * 260),
+                    ]
+
+                snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+                if snap and snap != INVALID_HANDLE_VALUE:
+                    try:
+                        entry = PROCESSENTRY32W()
+                        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                        if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+                            while True:
+                                exe = (entry.szExeFile or "").lower()
+                                if exe in ("chrome.exe", "msedge.exe"):
+                                    target_pids.add(int(entry.th32ProcessID))
+                                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                                    break
+                    finally:
+                        kernel32.CloseHandle(snap)
+            except Exception:
+                target_pids = set()
+
+            if not target_pids:
+                # PID 못 잡으면 ctypes 경로 포기 (MoveWindow 무차별 호출은 위험)
+                return False
+
+            moved_any = [False]
+            w = self.config.viewport.width
+            h = self.config.viewport.height
+
+            def _enum_proc(hwnd, _lparam):
+                try:
+                    if not IsWindowVisible(hwnd):
+                        return True
+                    if GetWindowTextLengthW(hwnd) == 0:
+                        return True
+                    pid = wintypes.DWORD(0)
+                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if int(pid.value) not in target_pids:
+                        return True
+                    # 우리 Chrome 창 — 포커스 안 빼앗고 이동
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                    MoveWindow(hwnd, int(x), int(y), int(w), int(h), True)
+                    moved_any[0] = True
+                except Exception:
+                    pass
+                return True
+
+            try:
+                EnumWindows(EnumWindowsProc(_enum_proc), 0)
+            except Exception:
+                return False
+            return moved_any[0]
+
+        # 핸들 늦게 만들어지는 경우 대비 0.1s × 3회 retry
+        for _ in range(3):
+            try:
+                ok = await _asyncio.get_event_loop().run_in_executor(None, _do_move)
+            except Exception as exc:
+                log.debug(f"ctypes 창 이동 실패: {exc}")
+                return False
+            if ok:
+                return True
+            await _asyncio.sleep(0.1)
+        return False
+
+    async def _move_chrome_window_powershell(self, x: int, y: int) -> None:
+        """레거시 PowerShell 경로 — ctypes 가 실패한 환경에서만 호출."""
+        import asyncio as _asyncio
+        ps_script = (
+            "$sig=@\"\n"
+            "  [DllImport(\"user32.dll\")] public static extern bool MoveWindow(IntPtr hWnd,int X,int Y,int W,int H,bool R);\n"
+            "  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd,int n);\n"
+            "\"@\n"
+            "Add-Type -MemberDefinition $sig -Name W -Namespace U -UsingNamespace System.Runtime.InteropServices\n"
+            "Get-Process chrome,msedge -ErrorAction SilentlyContinue | "
+            "Where-Object {$_.MainWindowHandle -ne 0} | "
+            "ForEach-Object {\n"
+            f"  [U.W]::ShowWindow($_.MainWindowHandle, 4)\n"
+            f"  [U.W]::MoveWindow($_.MainWindowHandle, {x}, {y}, "
+            f"{self.config.viewport.width}, {self.config.viewport.height}, $true)\n"
+            "}"
+        )
+        # powershell.exe 없으면 pwsh 로 fallback
+        for exe in ("powershell", "pwsh"):
+            try:
+                proc = await _asyncio.create_subprocess_exec(
+                    exe, "-NoProfile", "-WindowStyle", "Hidden",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", ps_script,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                return
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                log.debug(f"{exe} 창 이동 실패: {exc}")
+                return
 
     async def show_window(self, page: Page | None = None) -> None:
         """크롬 창을 화면 안으로 이동만 시킨다 (포커스 절대 건드리지 않음)."""

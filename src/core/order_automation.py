@@ -640,17 +640,21 @@ class OrderAutomation:
             return order
 
         except Exception as exc:
-            order.status = "failed"
-            order.error_message = f"{type(exc).__name__}: {exc}"
+            err_msg = f"{type(exc).__name__}: {exc}"
             if self.config.screenshot_on_error:
                 try:
                     order.screenshot_path = await save_error_screenshot(page, order.row)
                 except Exception as shot_exc:
                     log.warning(f"스크린샷 저장 실패: {shot_exc}")
-            self._emit(order, OrderState.FAILED, order.error_message)
-            log.error(f"주문 실패 행{order.row}: {order.error_message}")
-            # 에러 경로: 탭을 명시적으로 close() — 오염된 페이지가 다음 행에
-            # 전파되지 않도록. 다음 행은 깨끗한 새 탭에서 시작.
+            log.error(f"주문 실패 행{order.row}: {err_msg}")
+            # 실패 → '대기' 상태로 복귀.
+            # 이렇게 하면 사용자가 즉시 다시 더블클릭하여 재시도 가능하고,
+            # 별도의 '실패→대기' 리셋 단계가 필요 없다.
+            order.status = "pending"
+            order.error_message = None
+            self._checkpoints.pop(order.row, None)
+            self._emit(order, OrderState.PENDING, f"실패 후 대기 복귀: {err_msg}")
+            # 오염된 탭을 명시적으로 close() — 다음 시도는 깨끗한 새 탭에서 시작.
             if getattr(self.config, "skip_on_error", True):
                 await self.abandon(order, force_close=True)
             return order
@@ -1281,57 +1285,56 @@ class OrderAutomation:
         await self._switch_to_direct_input(page)
 
         # 1) 모든 필드 일괄 주입 (이름/전화/우편/주소만 — 통관/영문은 2단계에서)
-        await self._js_sweep_all_fields(page, order)
-
-        # 2) 받는사람 / 우편번호 / 기본주소 / 상세주소 셀렉터 보강
-        await self._force_fill(
-            page, "order_page.recipient_name", order.name, delay
-        )
-        await self._force_fill(
-            page, "order_page.zipcode_input", order.postal_code, delay
-        )
-        # 주소 입력 정책:
-        #  - base 칸: 도로명+번지수까지 (주소찾기 팝업이 행정 표준값으로 덮어씀)
-        #  - detail 칸: 아파트명/동/호 등 나머지 (분리 못 하면 원본 전체)
-        #  - 분리 규칙: 첫 번지수(숫자[-숫자]) 까지 base, 나머지 detail
+        # sweep 결과 카테고리 prefix 로 — 후속 _force_fill 호출 스킵 판단.
+        # 정상 케이스 (11번가 표준 폼) 에선 sweep 한 번으로 7개 필드 다 들어가서
+        # 후속 selector wait 1~2.5초가 통째로 사라진다.
+        touched = await self._js_sweep_all_fields(page, order)
+        sw = {t.split(":", 1)[0] for t in touched}
         addr_base = order.address_base()
         addr_detail = order.address_detail() or order.address
         log.info(
             f"행{order.row}: 주소 입력 — base={addr_base!r} detail={addr_detail!r}"
             f" (주소찾기 후 base 는 행정표준으로 자동 갱신됨)"
         )
-        await self._force_fill(
-            page, "order_page.address_base", addr_base, delay
-        )
-        await self._force_fill(
-            page, "order_page.address_detail", addr_detail, delay
-        )
+
+        # 2) 받는사람 / 우편번호 / 기본주소 / 상세주소 — sweep 이 못 잡은 것만 보강
+        if "name" not in sw:
+            await self._force_fill(page, "order_page.recipient_name", order.name, delay)
+        if "postal" not in sw:
+            await self._force_fill(page, "order_page.zipcode_input", order.postal_code, delay)
+        if "addr_base" not in sw:
+            await self._force_fill(page, "order_page.address_base", addr_base, delay)
+        if "addr_dtl" not in sw:
+            await self._force_fill(page, "order_page.address_detail", addr_detail, delay)
 
         # 2-b) 주소찾기 팝업 자동 처리
         await self._ensure_address_filled(page, order)
 
-        # 3) 전화번호 - 통합 or 분리 필드
-        if await self.selectors.exists(page, "order_page.phone", timeout_ms=800):
-            digits_only = order.phone.replace("-", "")
-            await self._force_fill(
-                page, "order_page.phone", digits_only, delay
-            )
-        else:
-            parts = order.phone.split("-")
-            if len(parts) == 3:
-                try:
-                    prefix_loc = await self.selectors.find(
-                        page, "order_page.phone_prefix", timeout_ms=2000
-                    )
-                    await prefix_loc.select_option(parts[0])
-                except ElementNotFoundError:
-                    pass
-                await self._force_fill(
-                    page, "order_page.phone_middle", parts[1], delay
-                )
-                await self._force_fill(
-                    page, "order_page.phone_suffix", parts[2], delay
-                )
+        # 3) 전화번호 — sweep 이 prefix/middle/suffix 다 채웠으면 추가 작업 0
+        phone_done = ("ph_middle" in sw) and ("ph_suffix" in sw) and ("prefix" in sw)
+        if not phone_done:
+            if await self.selectors.exists(page, "order_page.phone", timeout_ms=400):
+                digits_only = order.phone.replace("-", "")
+                await self._force_fill(page, "order_page.phone", digits_only, delay)
+            else:
+                parts = order.phone.split("-")
+                if len(parts) == 3:
+                    if "prefix" not in sw:
+                        try:
+                            prefix_loc = await self.selectors.find(
+                                page, "order_page.phone_prefix", timeout_ms=600
+                            )
+                            await prefix_loc.select_option(parts[0])
+                        except ElementNotFoundError:
+                            pass
+                    if "ph_middle" not in sw:
+                        await self._force_fill(
+                            page, "order_page.phone_middle", parts[1], delay
+                        )
+                    if "ph_suffix" not in sw:
+                        await self._force_fill(
+                            page, "order_page.phone_suffix", parts[2], delay
+                        )
 
         # 4) 통관번호 — 실패하면 주문을 실패시킨다
         self._emit(order, OrderState.FILL_FORM, "통관번호·영문이름 자동 입력 중")
@@ -1361,14 +1364,54 @@ class OrderAutomation:
         # 1) 주소찾기 버튼 자동 클릭 (팝업이 이미 떠있으면 스킵)
         # 즉응형 전략: popup 'page' 이벤트 + 50ms 간격 polling 을 동시에 race.
         # 둘 중 먼저 팝업을 잡는 쪽이 이김 → 팝업이 뜨는 그 즉시 다음 단계로 진입.
+        # claimed_popup: 'page' 이벤트로 직접 잡은 popup page 객체. 병렬 실행 시
+        # 같은 URL 의 다른 행 popup 과 섞이지 않도록 이 객체를 검색 단계에 넘긴다.
+        claimed_popup: Page | None = None
         popup_open = await self._is_address_popup_open(page)
         if not popup_open:
             ctx = page.context
             popup_future: asyncio.Future = asyncio.get_event_loop().create_future()
+            loop = asyncio.get_event_loop()
+
+            # 병렬 실행 안전: 이 주문서 page 가 직접 연 popup 만 인정.
+            # ctx.on("page") 는 컨텍스트 내 모든 새 탭에 fire 되므로 다른 행이
+            # 연 주소찾기 popup 이 이쪽에 잡혀서는 안 된다 (가로채기 방지).
+            # opener() 는 async 라 코루틴으로 검사 → run_coroutine_threadsafe 가 아닌
+            # 같은 loop 에서 create_task 로 안전하게 실행.
+            async def _claim_if_owned(p):
+                try:
+                    if p is page or p.is_closed():
+                        return
+                    try:
+                        opener = await p.opener()
+                    except Exception:
+                        opener = None
+                    # opener=page → 확실히 이 행의 popup → 채택
+                    # opener=None (Windows 일시적) → URL 이 주소찾기 패턴이면 채택
+                    # opener=다른 page → 다른 행의 popup → 무시
+                    if opener is not None and opener is not page:
+                        return
+                    if opener is None:
+                        url = (p.url or "").lower()
+                        is_addr_url = (
+                            "/addr/" in url
+                            or "searchaddr" in url
+                            or "zipcode" in url
+                            or "popup" in url
+                        )
+                        if not is_addr_url:
+                            return
+                    if not popup_future.done():
+                        popup_future.set_result(p)
+                except Exception:
+                    pass
 
             def _on_new_page(p):
-                if not popup_future.done():
-                    popup_future.set_result(p)
+                # 동기 콜백 → 비동기 opener 검사를 task 로 띄움
+                try:
+                    loop.create_task(_claim_if_owned(p))
+                except Exception:
+                    pass
 
             ctx.on("page", _on_new_page)
             try:
@@ -1398,6 +1441,7 @@ class OrderAutomation:
                                 f"URL={new_p.url[:80]}"
                             )
                             popup_open = True
+                            claimed_popup = new_p
                             # domcontentloaded 까지만 짧게 — load 까지는 안 기다림
                             try:
                                 await new_p.wait_for_load_state(
@@ -1430,6 +1474,7 @@ class OrderAutomation:
 
         # 2~3) 팝업 감지 여부와 무관하게 자동 검색 + 결과 선택 시도.
         # popup_open=False 라도 별도 창/iframe 어딘가에는 있을 수 있어서.
+        ok = False
         try:
             # 검색어는 우편번호 우선 — 5자리 숫자라 도로명·지번 변형에 휘둘리지 않고
             # 11번가 주소찾기 popup 이 가장 안정적으로 결과를 반환한다.
@@ -1443,12 +1488,30 @@ class OrderAutomation:
                 page, query,
                 postal=order.postal_code,
                 base_addr=order.address_base(),
+                claimed_popup=claimed_popup,
             )
             if ok:
                 log.info(
                     f"행{order.row}: 주소찾기 팝업 자동 검색·선택 완료 ({query!r})"
                 )
-                await asyncio.sleep(0.4)
+                # 보호 sleep 대신 — 주소 hidden(rcvrBaseAddr) 가 채워지길 polling.
+                # popup 클릭 직후 11번가 콜백이 hidden 필드를 세팅하는 데 보통 50~150ms 소요.
+                # 최대 600ms 만 기다리고 안 차면 어차피 _js_inject_address_fields 가 보강.
+                for _ in range(12):
+                    try:
+                        filled = await page.evaluate(
+                            r"""() => {
+                              const el = document.querySelector(
+                                'input[name="rcvrBaseAddr"], input[name="baseAddr"], input[name="addr"]'
+                              );
+                              return !!(el && (el.value || '').trim());
+                            }"""
+                        )
+                        if filled:
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
             else:
                 log.warning(
                     f"행{order.row}: 주소찾기 자동 처리 실패 — 사용자가 직접 선택"
@@ -1457,8 +1520,11 @@ class OrderAutomation:
             log.warning(f"행{order.row}: 주소찾기 자동 처리 예외: {exc}")
 
         # 4~5) 상세주소 + 비어있는 칸 라벨에 강제 주입
-        await self._js_inject_address_fields(page, order)
-        await asyncio.sleep(0.2)
+        # 주소찾기가 성공했으면 base(기본주소) 는 popup 이 채운 도로명 값 그대로 보존.
+        # 엑셀 원본이 지번이면 우리가 덮어쓰는 순간 addrTypCd=R + base=지번 미스매치가
+        # 발생해 11번가가 결제 시 "도로명 주소로 주문하셔야 합니다" alert 로 차단한다.
+        await self._js_inject_address_fields(page, order, preserve_base=ok)
+        # 주입 직후 React state 반영 약간 — sleep 대신 짧은 polling 으로 충분.
 
         # 점검 로그
         try:
@@ -1489,8 +1555,8 @@ class OrderAutomation:
                     log.info(
                         f"행{order.row}: 주소 일부 비어있음 → 재주입 (시도 {retry + 1}/3)"
                     )
-                    await self._js_inject_address_fields(page, order)
-                    await asyncio.sleep(0.3)
+                    await self._js_inject_address_fields(page, order, preserve_base=ok)
+                    await asyncio.sleep(0.1)
                     try:
                         status = await page.evaluate(
                             r"""() => {
@@ -1543,13 +1609,16 @@ class OrderAutomation:
                 return True
         except Exception:
             pass
-        # 2) 별도 popup window — 다른 행 점유 탭은 제외, opener 가 page 인 것만
+        # 2) 별도 popup window — 병렬 실행 시 다른 행의 popup 가로채기 방지.
+        # 다른 행이 활성 상태이면 opener 가 정확히 page 인 popup 만 인정.
+        # 단독 실행이면 (다른 활성 행 없음) opener=None 도 URL 매칭으로 통과 — Windows 호환.
         try:
             ctx = page.context
             owned_pages = set()
             for r, p2 in self._pages.items():
                 if p2 is not None and p2 is not page:
                     owned_pages.add(p2)
+            others_active = len(owned_pages) > 0
             for p in ctx.pages:
                 if p is page or p.is_closed():
                     continue
@@ -1561,9 +1630,12 @@ class OrderAutomation:
                         opener = await p.opener()
                     except Exception:
                         opener = None
-                    if opener is not None and opener is not page:
-                        continue
-                    return True
+                    # 병렬: opener=page 인 경우만 인정. opener=None 은 다음 tick 까지 보류.
+                    # 단독: opener=None 도 URL 매칭만으로 통과 (기존 동작 유지).
+                    if opener is page:
+                        return True
+                    if opener is None and not others_active:
+                        return True
         except Exception:
             pass
         return False
@@ -1584,6 +1656,7 @@ class OrderAutomation:
             for r, p in self._pages.items():
                 if p is not None and p is not page:
                     owned_pages.add(p)
+            others_active = len(owned_pages) > 0
 
             all_urls = []
             for p in ctx.pages:
@@ -1602,17 +1675,23 @@ class OrderAutomation:
                 )
                 if not is_addr_url:
                     continue
-                # opener 검사 — 가능한 경우 page 가 직접 연 popup 만 인정
+                # opener 검사 — 병렬 실행 시 다른 행 popup 가로채기 방지.
                 try:
                     opener = await p.opener()
                 except Exception:
                     opener = None
                 # opener=page → 확실히 이 행의 popup
-                # opener=None → Windows 에서 일시적 None 가능 → URL 매칭만으로 통과
                 # opener=다른 page → 다른 행의 popup → 제외
+                # opener=None: 다른 행이 활성이면 어느 행 소유인지 불확정 → 제외 (안전).
+                #              단독 실행이면 URL 매칭으로 통과 (Windows 호환).
                 if opener is not None and opener is not page:
                     log.debug(
                         f"_find_address_popup_pages: opener 다름 → skip ({url[:60]})"
+                    )
+                    continue
+                if opener is None and others_active:
+                    log.debug(
+                        f"_find_address_popup_pages: opener=None+병렬 → skip ({url[:60]})"
                     )
                     continue
                 out.append(p)
@@ -1664,6 +1743,7 @@ class OrderAutomation:
 
     async def _auto_search_and_pick_address(
         self, page: Page, query: str, postal: str = "", base_addr: str = "",
+        claimed_popup: Page | None = None,
     ) -> bool:
         """팝업에서 query 로 자동 검색 + 결과 자동 선택.
 
@@ -1677,6 +1757,10 @@ class OrderAutomation:
           A) inline layer / 같은 페이지 iframe
           B) 별도 popup window (window.open) — 11번가 buy/addr/searchAddrV2.tmall
         세 곳 다 시도.
+
+        claimed_popup: 호출자(_ensure_address_filled)가 'page' 이벤트로 직접 잡은
+        popup page 객체. 병렬 실행 중 같은 URL 의 다른 popup 과 섞이지 않게
+        이 page 객체에서만 검색·선택을 수행한다. None 이면 기존 URL 매칭으로 fallback.
         """
         if not query:
             return False
@@ -1748,6 +1832,46 @@ class OrderAutomation:
     return r.width > 0 && r.height > 0;
   }
 
+  // 도로명 탭 활성화 — 11번가 popup 의 도로명/지번 탭이 분리된 경우만 안전하게 처리.
+  // 결과 항목(<a onclick="fn_setAddr('road',...)">) 을 탭으로 오인해 클릭하면
+  // popup 이 첫 결과를 자동 선택해 닫혀버려 후속 검색이 부모 페이지로 fall through 한다.
+  // 그래서 '탭으로 보이는 명확한 요소' 만 좁혀서 다룬다.
+  try {
+    // 1) 결과 항목은 절대 건드리면 안 됨 (fn_setAddr / setAddr / selectAddr / chooseAddr)
+    const isResultAnchor = (el) => {
+      if (!el) return false;
+      const onc = (el.getAttribute && el.getAttribute('onclick') || '').toLowerCase();
+      return /fn_setaddr|setaddr|selectaddr|chooseaddr/.test(onc);
+    };
+    // 2) 탭 후보: role=tab 또는 명시적 탭 컨테이너 안의 자식만
+    const tabCandidates = Array.from(document.querySelectorAll(
+      '[role="tab"], '
+      + '.tab a, .tab button, .tab li, '
+      + '.tabs a, .tabs button, .tabs li, '
+      + '.tab_box a, .tab_box button, .tab_box li, '
+      + 'ul.tab > li, ul.tabs > li, '
+      + '[class*="tab" i] > a, [class*="tab" i] > button, [class*="tab" i] > li'
+    ));
+    const roadTabs = tabCandidates.filter(el => {
+      if (!visible(el)) return false;
+      if (isResultAnchor(el)) return false;
+      // 결과 컨테이너 안에 들어있는 요소는 탭이 아니다
+      if (el.closest('#roadList, #jibunList, .search_result_box, #searchResultBox, .result_list_box')) {
+        return false;
+      }
+      const t = (el.innerText || '').replace(/\s+/g, '');
+      // 정확히 "도로명" 또는 "도로명주소" 텍스트만 인정 (결과 행 텍스트 오인 방지)
+      return /^도로명(주소)?$/.test(t);
+    });
+    for (const tab of roadTabs) {
+      try { tab.click(); } catch(e) {}
+    }
+    // 지번 리스트만 명확히 숨김 — 너무 넓은 셀렉터는 도로명까지 같이 죽임.
+    // class/id 가 '지번 결과 리스트' 임이 분명한 것만.
+    document.querySelectorAll('#jibunList, tbody#jibunList, ul#jibunList')
+      .forEach(el => { try { el.style.display = 'none'; } catch(e){} });
+  } catch(e) {}
+
   // 컨테이너: 한 결과 행(도로명+지번+우편번호 묶음).
   // 11번가 popup 의 실제 DOM: <a onclick="$.fn_setAddr('road',...)"> 가
   // 실제 클릭 대상이므로 모든 'fn_setAddr' onclick 을 가진 a 를 직접 모은다.
@@ -1775,13 +1899,133 @@ class OrderAutomation:
     )).filter(visible);
   }
 
-  // 진단용: 컨테이너 개수와 첫 항목 미리 수집
-  const _diag = {
-    count: containers.length,
-    first: containers.length > 0
-      ? (containers[0].innerText || '').replace(/\s+/g, ' ').slice(0, 80)
-      : null,
-  };
+  // 도로명/지번 판별 헬퍼 — 11번가의 실제 onclick 패턴 분석 결과:
+  //   $.fn_setAddr('zipcode2','N','','','<URL-encoded 주소>',...)
+  // 한 anchor 의 onclick 인자에 base 주소 본문이 통째로 박혀 있다.
+  // 그 인자 텍스트가 도로명("…로 N", "…길 N") 인지 지번("…동/리/면/읍 N(-N)?") 인지로 판별.
+  function _decodeOnclick(a) {
+    if (!a || !a.getAttribute) return '';
+    const onc = a.getAttribute('onclick') || '';
+    // %uXXXX 형태(JS escape) 디코딩
+    let dec = onc;
+    try {
+      dec = onc.replace(/%u([0-9a-fA-F]{4})/g,
+        (_, h) => String.fromCharCode(parseInt(h, 16)));
+    } catch(e) {}
+    // %XX (URI-encoded) 도 처리
+    try { dec = decodeURIComponent(dec); } catch(e) {}
+    return dec;
+  }
+  // 도로명 패턴: '○○로/길 + 숫자' (○○대로, ○○로N번길, ○○길 등)
+  const ROAD_RE = /[가-힣A-Za-z0-9]+(?:대로|로|길|로\d+번길|길\d+번길)\s*\d/;
+  // 지번 패턴: '○○동/리/가/면/읍 + 숫자(-숫자)?' — 도로명 패턴과 상호배타
+  const JIBUN_RE = /[가-힣]+(?:동|리|가|면|읍)\s+\d+(?:-\d+)?/;
+
+  function _classify(a) {
+    if (!a) return '?';
+    const onc = (a.getAttribute && a.getAttribute('onclick') || '');
+
+    // ★ 1순위: anchor 표시 텍스트의 prefix.
+    //   11번가 popup 의 결과 행은 좌측에 '도로명' / '지번' 라벨 박스가 붙어있고,
+    //   anchor 의 innerText 가 이 라벨로 시작한다.
+    const txt = (a.innerText || '');
+    const txtNoWs = txt.replace(/\s+/g, '');
+    if (/^지번/.test(txtNoWs)) return 'J';
+    if (/^도로명/.test(txtNoWs)) return 'R';
+
+    // 2) onclick 첫 인자 — 'road'/'jibun' 처럼 명시적인 경우만 신뢰.
+    //   (참고: 11번가는 도로명/지번 anchor 모두에 'zipcode2' 를 쓰는 사례가 있어
+    //    'zipcode2' 자체로는 J 단정 불가. 진짜 신호는 위 텍스트 prefix.)
+    const firstArgMatch = onc.match(/[$.]?fn_setAddr\s*\(\s*['"]([^'"]+)['"]/i)
+                       || onc.match(/setAddr\s*\(\s*['"]([^'"]+)['"]/i);
+    if (firstArgMatch) {
+      const arg = firstArgMatch[1].toLowerCase();
+      if (arg === 'road' || arg === 'roadaddr' || arg === 'r') return 'R';
+      if (arg === 'jibun' || arg === 'jibun2' || arg === 'j') return 'J';
+      // 'zipcode2' / 'zipcode' 는 도로명·지번 공용 함수명 → 단정 못 함
+    }
+
+    // 3) 텍스트 패턴 (한 줄 안에 도로명만/지번만)
+    const hasRoad = ROAD_RE.test(txt);
+    const hasJibun = JIBUN_RE.test(txt);
+    if (hasRoad && !hasJibun) return 'R';
+    if (hasJibun && !hasRoad) return 'J';
+
+    // 4) ancestor 식별자
+    let cur = a;
+    for (let i = 0; cur && i < 6; i++, cur = cur.parentElement) {
+      const id = (cur.id || '').toLowerCase();
+      const cls = (cur.className && cur.className.baseVal !== undefined
+                   ? cur.className.baseVal : (cur.className || '')).toString().toLowerCase();
+      if (/jibun/.test(id) || /jibun/.test(cls)) return 'J';
+      if (/road/.test(id) || /road/.test(cls)) return 'R';
+    }
+    // 5) onclick 의 단일 R/J 플래그 (다른 사이트 호환)
+    const oncLower = onc.toLowerCase();
+    if (/['"]r['"]/.test(oncLower) || /roadaddr|roadnm|dorono/i.test(oncLower)) return 'R';
+    if (/['"]j['"]/.test(oncLower) || /jibun/i.test(oncLower)) return 'J';
+    return '?';
+  }
+  function _isJibun(a) { return _classify(a) === 'J'; }
+  function _isRoad(a) { return _classify(a) === 'R'; }
+
+  // 정규화: 컨테이너 자체가 a 인 경우, 지번 a 를 같은 결과 행의 도로명 a 로 교체.
+  // 11번가 popup 은 보통 <tr> 또는 <li> 안에 도로명 a / 지번 a 두 개를 둔다.
+  // 가장 가까운 TR/LI 조상까지 올라가 그 안의 도로명 a 를 우선 노출.
+  containers = containers.map(el => {
+    if (!el.matches || !el.matches('a, button')) return el;
+    if (!_isJibun(el)) return el;
+    let row = el;
+    for (let i = 0; row && i < 6; i++) {
+      if (row.tagName === 'TR' || row.tagName === 'LI') break;
+      row = row.parentElement;
+    }
+    const scope = row || el.parentElement || document;
+    const roadCand = Array.from(scope.querySelectorAll('a[onclick], button[onclick]'))
+      .find(a => _isRoad(a) && visible(a));
+    return roadCand || el;  // 도로명 형제 없으면 그대로 두되 후속 매칭 단계서 제외
+  });
+
+  // 지번 anchor 만 남은 컨테이너는 매칭 후보에서 제거 (잘못 클릭 방지).
+  // 결과적으로 도로명만 남거나, 도로명/지번 구분 모호한(?) anchor 만 남음.
+  containers = containers.filter(el => {
+    if (!el.matches || !el.matches('a, button')) return true;  // tr/li 묶음은 통과
+    return !_isJibun(el);
+  });
+
+
+  // 진단용: 분류 통계 + 첫 도로명/지번 anchor 샘플 (디버깅용)
+  const _diag = (function() {
+    let nR = 0, nJ = 0, nU = 0;
+    let firstR = null, firstJ = null, firstU = null;
+    for (const c of containers) {
+      const a = (c.matches && c.matches('a, button')) ? c
+              : (c.querySelector && c.querySelector('a[onclick], button[onclick]'));
+      if (!a) { nU++; continue; }
+      const cls = _classify(a);
+      const onc = (a.getAttribute && a.getAttribute('onclick') || '').slice(0, 100);
+      const txt = (c.innerText || '').replace(/\s+/g, ' ').slice(0, 60);
+      if (cls === 'R') { nR++; if (!firstR) firstR = txt + '|' + onc; }
+      else if (cls === 'J') { nJ++; if (!firstJ) firstJ = txt + '|' + onc; }
+      else { nU++; if (!firstU) firstU = txt + '|' + onc; }
+    }
+    return {
+      count: containers.length,
+      R: nR, J: nJ, U: nU,
+      firstR: firstR, firstJ: firstJ, firstU: firstU,
+      first: containers.length > 0
+        ? (containers[0].innerText || '').replace(/\s+/g, ' ').slice(0, 80)
+        : null,
+      firstOnclick: (function() {
+        if (containers.length === 0) return null;
+        const c = containers[0];
+        const a = (c.matches && c.matches('a, button')) ? c
+                : (c.querySelector && c.querySelector('a[onclick], button[onclick]'));
+        const onc = (a && a.getAttribute) ? (a.getAttribute('onclick') || '') : '';
+        return onc.slice(0, 120);
+      })(),
+    };
+  })();
 
   function fire(el) {
     // 11번가 popup 의 <a onclick="$.fn_setAddr(...)"> 는 onclick 속성이
@@ -1806,20 +2050,40 @@ class OrderAutomation:
   }
 
   function pick(container, label) {
-    // 컨테이너에서 진짜 클릭해야 할 요소 결정 — onclick 가진 a 가 우선.
-    // 컨테이너 자체가 이미 a/button 이면 그걸 그대로 사용.
-    let target;
+    // 컨테이너에서 진짜 클릭해야 할 요소 결정.
+    // 도로명 a / 지번 a 가 별도로 존재 — 도로명을 강력히 우선.
+    // 위에서 정의한 _classify / _isRoad / _isJibun 을 그대로 사용.
+    const isRoadAnchor = _isRoad;
+    const isJibunAnchor = _isJibun;
+
+    let target = null;
     if (container.matches && container.matches('a, button, [role="button"]')) {
       target = container;
+      // 컨테이너 자체가 지번 a 면, 형제 중 도로명 a 로 교체 시도
+      if (isJibunAnchor(target)) {
+        const parent = container.parentElement;
+        if (parent) {
+          const cand = Array.from(parent.querySelectorAll('a[onclick], button[onclick]'))
+            .find(isRoadAnchor);
+          if (cand) target = cand;
+        }
+      }
     } else {
-      target = container.querySelector('a[onclick], button[onclick]')
-            || container.querySelector('a, button, [role="button"]')
+      const anchors = Array.from(
+        container.querySelectorAll('a[onclick], button[onclick], a, button, [role="button"]')
+      );
+      target = anchors.find(isRoadAnchor)
+            || anchors.find(a => !isJibunAnchor(a))
+            || anchors[0]
             || container;
     }
     const ok = fire(target);
     if (ok) {
       const t = (container.innerText || '').replace(/\s+/g, ' ').slice(0, 80);
-      return label + ':' + t;
+      const kind = isRoadAnchor(target) ? 'R' : (isJibunAnchor(target) ? 'J' : '?');
+      const onc = (target && target.getAttribute && target.getAttribute('onclick')) || '';
+      const ocSlice = onc.slice(0, 80).replace(/\s+/g, ' ');
+      return label + '[' + kind + ']:' + t + ' | oc=' + ocSlice;
     }
     return null;
   }
@@ -1835,55 +2099,187 @@ class OrderAutomation:
     return el.innerText || '';
   }
 
-  // 1) 우편번호 일치 항목 우선
+  // baseAddr 에서 도로명 토큰 추출 — '○○로' / '○○길' / '○○대로' / '○○로N번길'
+  // 같은 우편번호 안 여러 도로명 중 정답을 가르려면 이 도로명 토큰이 결과 텍스트에
+  // 반드시 포함돼야 한다. (예: '어곡공단로' 가 결과에 없으면 '대동로' 결과는 다른 주소)
+  function _extractRoadToken(b) {
+    if (!b) return '';
+    // 'N번길' 같은 합성도 포함. 우선 가장 긴 매칭부터.
+    const m1 = b.match(/[가-힣A-Za-z0-9]+로\s*\d+번길/);
+    if (m1) return m1[0].replace(/\s+/g, '');
+    const m2 = b.match(/[가-힣A-Za-z0-9]+(?:대로|로|길)/);
+    if (m2) return m2[0];
+    return '';
+  }
+  // baseAddr 에서 번지수 추출 — '도로명 N' 의 N. 다른 번지수 같은 도로명 사고 방지.
+  function _extractRoadNumber(b) {
+    if (!b) return '';
+    const m = b.match(/(?:대로|로|길)\s*(\d+(?:-\d+)?)/);
+    return m ? m[1] : '';
+  }
+  const baseRoadToken = _extractRoadToken(baseAddr || '');
+  const baseRoadNumber = _extractRoadNumber(baseAddr || '');
+  const baseHasRoad = !!baseRoadToken;
+
+  // 매칭 정책 — "원래 주소와 다른 주소" 가 자동 선택되는 사고 차단:
+  //   case A) base 가 도로명을 포함 (예: '경상남도 양산시 어곡공단로 143')
+  //           → 결과 텍스트에 그 도로명 토큰('어곡공단로')이 반드시 있어야 매칭.
+  //              번지수까지 일치하면 추가 가중치.
+  //   case B) base 가 지번 ('서울특별시 노원구 하계동 271-3')
+  //           → 도로명을 모르므로 도로명 토큰 강제 못 함. 동(洞) 토큰 일치 필수
+  //              + base 토큰 70%+ 일치 + 후보 단일/압도적일 때만 채택.
+  //              모호하면 fail → 호출자가 검색어 시퀀스 다음 단계로 재시도.
+  function _evaluateAnchor(el) {
+    const a = (el.matches && el.matches('a, button')) ? el
+            : (el.querySelector && el.querySelector('a[onclick], button[onclick]'));
+    if (!a) return null;
+    const cls = _classify(a);
+    if (cls === 'J') return null;  // 지번은 절대 후보 아님
+    const aTxt = (a.innerText || '').replace(/\s+/g, ' ');
+
+    if (baseHasRoad) {
+      if (!aTxt.includes(baseRoadToken)) return null;  // 다른 도로명 결과 → 거부
+      let bonus = 0;
+      if (baseRoadNumber) {
+        const numRe = new RegExp(baseRoadToken
+          .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*' + baseRoadNumber + '\\b');
+        if (numRe.test(aTxt)) bonus = 10;
+      }
+      const tokens = (baseAddr || '').split(/\s+/).filter(t => t.length >= 1);
+      let score = 0;
+      for (const tok of tokens) if (aTxt.includes(tok)) score++;
+      // anchor 자체 점수가 낮으면 묶음/형제 텍스트로도 추가 점수 (시·도 정보가 부모 행에만 있는 경우)
+      if (score < tokens.length) {
+        const groupTxt = fullText(el).replace(/\s+/g, ' ');
+        let probe = aTxt + ' ' + groupTxt;
+        try {
+          const parent = a.parentElement;
+          if (parent) {
+            const sibs = Array.from(parent.querySelectorAll(
+              'a[onclick*="fn_setAddr"], a[onclick*="setAddr"]'
+            ));
+            const idx = sibs.indexOf(a);
+            if (idx >= 0) {
+              if (idx - 1 >= 0) probe += ' ' + (sibs[idx - 1].innerText || '');
+              if (idx + 1 < sibs.length) probe += ' ' + (sibs[idx + 1].innerText || '');
+            }
+          }
+        } catch(e) {}
+        score = 0;
+        for (const tok of tokens) if (probe.includes(tok)) score++;
+      }
+      return { el: el, anchor: a, score: score + bonus, total: tokens.length, bonus: bonus, cls: cls };
+    }
+
+    // base 가 지번 — 11번가 popup 의 도로명 결과 행은 보통
+    //   '인천광역시 미추홀구 매소홀로 504 (문학동, 법진빌딩)'
+    //   처럼 도로명 + 괄호 안 (동, 건물명) 형태. 즉 도로명 결과 텍스트에
+    //   base 의 '동' 토큰이 포함되면 그 도로명이 정답일 가능성이 매우 높다.
+    //   추가로 지번 번지수까지 텍스트에 들어있으면 거의 확정.
+    if (cls !== 'R') {
+      if (cls !== '?' || !ROAD_RE.test(aTxt)) return null;
+    }
+    // base 의 지번 번지(예: '1887-4') 와 동(예: '중산동') 추출
+    const jibunNumMatch = (baseAddr || '').match(/(?:동|리|면|읍|가)\s*(\d+(?:-\d+)?)/);
+    const baseJibunNum = jibunNumMatch ? jibunNumMatch[1] : '';
+    const dongMatch = (baseAddr || '').match(/[가-힣]+(?:동|리|면|읍|가)/);
+    const baseDong = dongMatch ? dongMatch[0] : '';
+
+    // 결과 묶음 텍스트 — 다음 3계층 모두 합쳐 검사.
+    //  1) anchor 자기 텍스트
+    //  2) 가장 가까운 tr/li 조상 텍스트 (한 행 묶음)
+    //  3) DOM 인접 형제(직전/직후) anchor 의 텍스트 (도로명/지번 a 가 별도일 때)
+    const groupTxt = fullText(el).replace(/\s+/g, ' ');
+    let probeTxt = aTxt + ' ' + groupTxt;
+    try {
+      // 같은 부모 안에서 인접한 fn_setAddr anchor 의 텍스트도 함께 (지번 a 가 별도일 때)
+      const parent = a.parentElement;
+      if (parent) {
+        const sibs = Array.from(parent.querySelectorAll(
+          'a[onclick*="fn_setAddr"], a[onclick*="setAddr"]'
+        ));
+        const idx = sibs.indexOf(a);
+        if (idx >= 0) {
+          if (idx - 1 >= 0) probeTxt += ' ' + (sibs[idx - 1].innerText || '');
+          if (idx + 1 < sibs.length) probeTxt += ' ' + (sibs[idx + 1].innerText || '');
+        }
+      }
+    } catch(e) {}
+
+    if (baseDong && !probeTxt.includes(baseDong)) return null;
+
+    let score = 0;
+    let bonus = 0;
+    const tokens = (baseAddr || '').split(/\s+/).filter(t => t.length >= 1);
+    for (const tok of tokens) if (probeTxt.includes(tok)) score++;
+    // ★ 핵심 보너스: 같은 묶음/형제에 base 의 지번 번지(예: '1887-4') 가
+    //   그대로 표기되면 거의 정답.
+    if (baseJibunNum && probeTxt.includes(baseJibunNum)) bonus += 20;
+    if (score + bonus < Math.ceil(tokens.length * 0.7)) return null;
+    return { el: el, anchor: a, score: score + bonus, total: tokens.length, bonus: bonus, cls: cls };
+  }
+
+  // 1) 우편번호 매칭 컨테이너 안에서 후보 평가. 그 다음 전체에서.
+  let candidates = [];
   if (postal) {
     for (const el of containers) {
       const t = fullText(el).replace(/\s+/g, ' ');
-      if (t.includes(postal)) {
-        const r = pick(el, 'postal-match');
+      if (!t.includes(postal)) continue;
+      const ev = _evaluateAnchor(el);
+      if (ev) candidates.push(ev);
+    }
+  }
+  if (candidates.length === 0) {
+    for (const el of containers) {
+      const ev = _evaluateAnchor(el);
+      if (ev) candidates.push(ev);
+    }
+  }
+
+  if (candidates.length > 0) {
+    // 정렬: 점수 내림차순, 동률이면 DOM 순서(원본 인덱스) 오름차순.
+    // 11번가 popup 결과는 '관련도 높은 순'으로 정렬돼있어 첫 결과가 정답 확률 높음.
+    candidates.forEach((c, i) => { c._idx = i; });
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a._idx - b._idx;
+    });
+    const top = candidates[0];
+
+    // base 가 도로명을 포함한 케이스 — 도로명 토큰 강제 매칭이 이미 적용됐으므로
+    // 후보 여러 개여도 점수 1등을 그대로 채택 (다른 도로명 anchor 는 _evaluateAnchor 에서 거부됨).
+    // base 가 지번 + 후보 여러 개 + 보너스(번지 일치)도 없는 경우만 모호함 진단:
+    //   1등이 압도적이면 채택, 아니면 DOM 첫 후보 채택 (사용자 개입 없이 자동화).
+    if (!baseHasRoad && candidates.length > 1 && top.bonus === 0) {
+      const second = candidates[1];
+      const dominant = (top.score - second.score >= 2) || (top.score >= second.score * 1.5);
+      if (!dominant) {
+        // DOM 순서로 가장 앞선(인덱스 낮은) 후보를 정답으로 채택.
+        // 11번가 popup 의 결과 정렬 순서가 관련도 기준이므로 첫 결과가 정답 확률 가장 높음.
+        candidates.sort((a, b) => a._idx - b._idx);
+        const firstCand = candidates[0];
+        const r = pick(firstCand.el,
+          'addr-match-DT-first(' + firstCand.score + '/' + firstCand.total + ')');
         if (r) return r;
       }
     }
-  }
 
-  // 2) baseAddr 토큰 매칭이 가장 많은 항목
-  if (baseAddr) {
-    const tokens = baseAddr.split(/\s+/).filter(t => t.length >= 1);
-    let best = null, bestScore = 0;
-    for (const el of containers) {
-      const t = fullText(el);
-      let score = 0;
-      for (const tok of tokens) if (t.includes(tok)) score++;
-      if (score > bestScore) { bestScore = score; best = el; }
-    }
-    if (best && bestScore >= Math.ceil(tokens.length * 0.6)) {
-      const r = pick(best, 'addr-match(' + bestScore + '/' + tokens.length + ')');
-      if (r) return r;
-    }
-  }
-
-  // 3) '도로명' 라벨 가진 첫 항목
-  for (const el of containers) {
-    const t = (el.innerText || '').trim();
-    if (/도로명/.test(t)) {
-      const r = pick(el, 'road');
-      if (r) return r;
-    }
-  }
-
-  // 4) 첫 결과
-  for (const el of containers) {
-    const t = (el.innerText || '').trim();
-    if (!t || t.length < 6) continue;
-    const r = pick(el, 'first');
+    const label = baseHasRoad
+      ? 'addr-match-RT(' + top.score + '/' + top.total + (top.bonus ? '+num' : '') + ')'
+      : 'addr-match-DT(' + top.score + '/' + top.total + (top.bonus ? '+num' : '') + ')';
+    const r = pick(top.el, label);
     if (r) return r;
   }
-  // 결과 0건이거나 모두 클릭 실패 → 진단 정보 반환
-  return 'no-pick(count=' + _diag.count + ', first=' + (_diag.first || '?') + ')';
+  // 매칭 후보 없음 — 호출자가 검색어 시퀀스 다음 단계로 재시도
+  // 결과 0건이거나 모두 클릭 실패 → 진단 정보 반환 (onclick 패턴 + 분류 통계 포함)
+  return 'no-pick(count=' + _diag.count
+       + ', R=' + _diag.R + ', J=' + _diag.J + ', U=' + _diag.U
+       + ', first=' + (_diag.first || '?')
+       + ', oc=' + (_diag.firstOnclick || '?') + ')';
 }
 """
 
-        async def try_in_context(target) -> bool:
+        async def try_in_context(target, query_override: str | None = None) -> bool:
             """target 은 Page 또는 Frame. 검색 + 결과 선택 시도.
 
             견고함을 위한 polling 전략:
@@ -1893,13 +2289,16 @@ class OrderAutomation:
               4) 결과가 안 뜨면 검색 재시도 (최대 3회) — 첫 시도가 너무 빨라
                  input 이 아직 React 상태 갱신 안 한 케이스 방어
             """
+            effective_query = query_override or query
             try:
                 ctx_url = ""
                 try:
                     ctx_url = target.url if not callable(target.url) else target.url()
                 except Exception:
                     pass
-                log.info(f"주소찾기 try_in_context 시작 ({ctx_url[:80]})")
+                log.info(
+                    f"주소찾기 try_in_context 시작 query={effective_query!r} ({ctx_url[:80]})"
+                )
             except Exception:
                 pass
 
@@ -1911,7 +2310,7 @@ class OrderAutomation:
                 input_ready = False
                 for _ in range(150):
                     try:
-                        r = await target.evaluate(search_js, [query])
+                        r = await target.evaluate(search_js, [effective_query])
                     except Exception as exc:
                         log.debug(f"search_js 실패: {exc}")
                         await asyncio.sleep(0.1)
@@ -1949,9 +2348,14 @@ class OrderAutomation:
                         got_result = True
 
                 if got_result:
+                    # 결과는 떴지만 도로명 후보가 없거나 클릭 실패한 경우.
+                    # R=0 이면 현재 검색어로는 도로명 결과 부재 → 다른 검색어로 재시도.
+                    is_r_zero = bool(last_diag and 'R=0' in last_diag)
                     log.warning(
                         f"주소찾기: 결과는 떴지만 클릭 실패 — {last_diag}"
                     )
+                    if is_r_zero:
+                        return False  # 호출자가 다른 검색어로 재시도하게 fail 반환
                     return False
                 # 결과 자체가 0건 → 검색 재시도 (검색이 너무 빨라 입력 안 먹은 케이스)
                 log.info(
@@ -1962,14 +2366,83 @@ class OrderAutomation:
             log.warning("주소찾기 결과 선택 최종 실패")
             return False
 
-        # 1) 별도 popup window — 50ms 간격 polling 으로 즉응 (최대 20초)
-        # 발견 즉시 break → 검색 단계로 진입.
+        # 1) 별도 popup window — claimed_popup 이 있으면 그것만 사용 (병렬 충돌 방지).
+        # 호출자가 'page' 이벤트로 직접 붙잡은 page 객체라 같은 URL 의 다른 행 popup
+        # 과 절대 섞이지 않는다. 없으면 URL 매칭으로 fallback.
         popup_pages: list[Page] = []
-        for _ in range(400):  # 50ms * 400 = 20s
-            popup_pages = await self._find_address_popup_pages(page)
-            if popup_pages:
-                break
-            await asyncio.sleep(0.05)
+        if claimed_popup is not None and not claimed_popup.is_closed():
+            popup_pages = [claimed_popup]
+            log.info(
+                f"주소찾기: claimed_popup 사용 (URL={(claimed_popup.url or '')[:80]})"
+            )
+        else:
+            for _ in range(400):  # 50ms * 400 = 20s
+                popup_pages = await self._find_address_popup_pages(page)
+                if popup_pages:
+                    break
+                await asyncio.sleep(0.05)
+
+        # 검색어 후보 시퀀스 — 도로명 결과 0건일 때 차례로 시도해 도로명을 끝까지 찾음.
+        # (사용자 직접 처리 없이 100% 자동 완성을 목표)
+        # 1순위: 우편번호 (가장 정확). 도로명 결과 부재 시 동/리 토큰까지 단축한 base.
+        # 2순위: 동까지만 잘라낸 base. 11번가 검색은 동 단위에서 도로명 결과 풍부.
+        # 3순위: 시/구만 남긴 base — 마지막 fallback.
+        query_candidates: list[str] = []
+        if query:
+            query_candidates.append(query)
+
+        import re as _re
+
+        def _shorten_base(b: str) -> list[str]:
+            outs: list[str] = []
+            tokens = (b or "").split()
+            # 동/리/면/읍 토큰까지만 잘라낸 검색어
+            for i, tok in enumerate(tokens):
+                if any(tok.endswith(suf) for suf in ("동", "리", "면", "읍")):
+                    outs.append(" ".join(tokens[: i + 1]))
+                    break
+            # 시/군/구 토큰까지만 잘라낸 검색어
+            for i, tok in enumerate(tokens):
+                if any(tok.endswith(suf) for suf in ("시", "군", "구")):
+                    outs.append(" ".join(tokens[: i + 1]))
+                    break
+            return outs
+
+        def _road_query(b: str) -> list[str]:
+            """base 에 도로명이 있으면 '도로명 + 번지' 검색어로 정확 매칭 유도.
+            예: '충청남도 천안시 동남구 병천면 충절로 1896' →
+                ['충절로 1896', '병천면 충절로 1896'].
+            """
+            if not b:
+                return []
+            outs: list[str] = []
+            m = _re.search(r"([가-힣A-Za-z0-9]+(?:대로|로|길))\s*(\d+(?:-\d+)?)", b)
+            if not m:
+                return outs
+            road = m.group(1)
+            num = m.group(2)
+            outs.append(f"{road} {num}")
+            # 동/면/읍/리 prefix 도 함께 — 동명도시 도로명 동음이의 방어
+            tokens = b.split()
+            for i, tok in enumerate(tokens):
+                if any(tok.endswith(suf) for suf in ("동", "리", "면", "읍")):
+                    outs.append(f"{tok} {road} {num}")
+                    break
+            return outs
+
+        if base_addr:
+            # ★ 도로명+번지 검색을 우편번호 다음 우선순위로 (case A 정확도 향상)
+            for s in _road_query(base_addr):
+                if s and s not in query_candidates:
+                    query_candidates.append(s)
+            for s in _shorten_base(base_addr):
+                if s and s not in query_candidates:
+                    query_candidates.append(s)
+
+        log.info(f"주소찾기 검색어 후보: {query_candidates}")
+
+        async def _attempt(target, q: str) -> bool:
+            return await try_in_context(target, query_override=q)
 
         for popup_page in popup_pages:
             # domcontentloaded 까지만 짧게 — load 완료는 검색 polling 이 처리.
@@ -1979,32 +2452,45 @@ class OrderAutomation:
                 )
             except Exception:
                 pass
-            if await try_in_context(popup_page):
-                return True
+            for q in query_candidates:
+                if await _attempt(popup_page, q):
+                    return True
             # popup main_frame 이 안 됐으면 그 안의 iframe 시도
             for frame in popup_page.frames:
                 if frame is popup_page.main_frame:
                     continue
-                if await try_in_context(frame):
-                    return True
+                for q in query_candidates:
+                    if await _attempt(frame, q):
+                        return True
 
         # 2) 같은 page 의 main + iframe
-        if await try_in_context(page):
-            return True
+        for q in query_candidates:
+            if await _attempt(page, q):
+                return True
         for frame in page.frames:
             if frame is page.main_frame:
                 continue
-            if await try_in_context(frame):
-                return True
+            for q in query_candidates:
+                if await _attempt(frame, q):
+                    return True
         return False
 
-    async def _js_inject_address_fields(self, page: Page, order: Order) -> None:
+    async def _js_inject_address_fields(
+        self, page: Page, order: Order, preserve_base: bool = False,
+    ) -> None:
         """우편번호 / 기본주소 / 상세주소 input 에 JS 로 직접 값 주입.
 
         - readonly/disabled 강제 해제
         - 기존 값 무시하고 무조건 덮어쓰기 (이전 자동화 시도가 잘못된 값을 넣었을 수 있음)
         - placeholder/name/id/aria-label 어디든 매칭되면 주입
         - input/change 이벤트 dispatch (React/Vue 의 controlled input 도 동작)
+
+        preserve_base=True 일 때:
+          - 주소찾기 popup 이 도로명 base + addrTypCd=R 을 함께 세팅한 직후에 호출됨.
+          - 우리가 가진 엑셀 base 가 지번이면 덮어쓰는 순간 addrTypCd=R + base=지번
+            미스매치가 생겨 11번가가 결제 시 alert 로 차단한다.
+          - 그래서 이 모드에선 base 칸은 비어있을 때만 fallback 으로 채우고,
+            popup 이 채운 값은 절대 덮어쓰지 않는다. 우편번호/상세주소만 안전하게 채운다.
         """
         # base = 도로명+번지수까지, detail = 아파트명/동/호 등 나머지.
         # 분리 못하면 detail 에 원본 전체 (정보 손실 방지).
@@ -2012,7 +2498,7 @@ class OrderAutomation:
         addr_detail = order.address_detail() or order.address
         try:
             touched = await page.evaluate(
-                r"""([postal, baseAddr, detailAddr]) => {
+                r"""([postal, baseAddr, detailAddr, preserveBase]) => {
                   function setVal(el, v) {
                     try { el.removeAttribute('readonly'); } catch(e){}
                     try { el.removeAttribute('disabled'); } catch(e){}
@@ -2033,7 +2519,7 @@ class OrderAutomation:
                     const t = (el.type||'').toLowerCase();
                     if (['checkbox','radio','submit','button','file','image','hidden'].includes(t)) continue;
                     const hay = hayOf(el);
-                    // 우편번호 — 무조건 덮어씀
+                    // 우편번호 — 무조건 덮어씀 (popup 이 채운 값과 동일한 게 정상)
                     if (/(zip|post|우편)/.test(hay)) {
                       setVal(el, postal);
                       touched.push('postal:' + (el.name || el.id || el.placeholder));
@@ -2049,6 +2535,11 @@ class OrderAutomation:
                     }
                     // 기본주소
                     if (/(기본.*주소|base.*addr|baseAddr|rcvrBaseAddr|^addr$|pickupBaseAddr)/i.test(hay)) {
+                      // preserveBase: popup 이 도로명으로 잘 채워둔 값 보존
+                      if (preserveBase && (el.value || '').trim()) {
+                        touched.push('base-preserved:' + (el.name || el.id || el.placeholder));
+                        continue;
+                      }
                       setVal(el, baseAddr);
                       touched.push('base:' + (el.name || el.id || el.placeholder));
                       continue;
@@ -2062,7 +2553,7 @@ class OrderAutomation:
                   }
                   return touched;
                 }""",
-                [order.postal_code, addr_base, addr_detail],
+                [order.postal_code, addr_base, addr_detail, preserve_base],
             )
             if touched:
                 log.info(f"행{order.row}: 주소 JS 강제 주입: {touched}")
@@ -2170,9 +2661,9 @@ class OrderAutomation:
         if await _try_once():
             return
 
-        # 통관번호 조회 결과 등 비동기 갱신 대기 후 재시도 (최대 3회)
+        # 통관번호 조회 결과 등 비동기 갱신 대기 후 재시도 (최대 3회) — 짧은 polling
         for attempt in range(3):
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
             if await _try_once():
                 return
             log.debug(f"영문이름 재시도 {attempt + 1}/3")
@@ -2636,14 +3127,13 @@ class OrderAutomation:
                 f"행{order.row}: 엑셀에 통관번호가 비어 있습니다."
             )
 
-        # 0) 통관번호 섹션이 lazy-load 되는 경우를 대비해 페이지 하단까지 스크롤
+        # 0) 통관번호 섹션이 lazy-load 되는 경우를 대비해 페이지 하단까지 스크롤.
+        # sleep 대신 — 다음 단계(셀렉터 exists) 자체가 polling 이므로 즉시 진행.
         try:
             await page.evaluate(
-                "() => window.scrollTo(0, document.body.scrollHeight)"
+                "() => { window.scrollTo(0, document.body.scrollHeight); "
+                "window.scrollTo(0, 0); }"
             )
-            await asyncio.sleep(0.2)
-            # 스크롤 후 다시 위로 (UI 원복)
-            await page.evaluate("() => window.scrollTo(0, 0)")
         except Exception:
             pass
 
@@ -2749,14 +3239,29 @@ class OrderAutomation:
             )
             if switched:
                 log.info(f"행{order.row}: 통관번호 '직접입력' 전환: {switched}")
-                # select 변경 후 input 이 활성화되기까지 살짝 대기
-                await asyncio.sleep(0.4)
+                # input 활성화 polling — 최대 400ms, 잡히면 즉시 진행.
+                for _ in range(8):
+                    try:
+                        ready = await page.evaluate(
+                            r"""() => {
+                              const el = document.querySelector(
+                                'input[name="psnCscUniqNo"], input#psnCscUniqNo'
+                              );
+                              if (!el) return false;
+                              return !el.disabled && !el.readOnly;
+                            }"""
+                        )
+                        if ready:
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
         except Exception as exc:
             log.debug(f"통관 '직접입력' 전환 실패: {exc}")
 
-        # 1) 셀렉터 경로
+        # 1) 셀렉터 경로 — timeout 단축 (이미 위 polling 으로 input 준비된 상태)
         filled = False
-        if await self.selectors.exists(page, "order_page.customs_id", timeout_ms=1500):
+        if await self.selectors.exists(page, "order_page.customs_id", timeout_ms=400):
             filled = await self._force_fill(
                 page, "order_page.customs_id", cid, delay
             )
@@ -2921,7 +3426,7 @@ class OrderAutomation:
 
     async def _js_sweep_all_fields(
         self, page: Page, order: Order, only_postal: bool = False
-    ) -> None:
+    ) -> list[str]:
         """페이지의 모든 input/select 를 훑어 placeholder/label/name/id/aria-label
         매칭으로 엑셀 값을 강제 주입. 셀렉터가 놓친 필드의 안전망.
 
@@ -3119,8 +3624,10 @@ class OrderAutomation:
                 log.info(
                     f"JS sweep({tag}) 으로 필드 {len(touched)}개 주입: {touched}"
                 )
+            return list(touched) if touched else []
         except Exception as exc:
             log.debug(f"JS sweep 실패: {exc}")
+            return []
 
     async def _click_final_payment(self, page: Page) -> None:
         """약관 전체동의 + 결제수단(카드) 선택 + 결제하기 클릭."""
