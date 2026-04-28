@@ -2608,17 +2608,18 @@ class OrderAutomation:
         except Exception:
             pass
 
-        # 0-b) "입력 / 선택" 토글이 '선택' 으로 되어있으면 '입력' 으로 강제 전환.
-        #      11번가는 회원이 등록한 통관번호가 있으면 기본이 '선택' 이라
-        #      그 위에 새 영문이름·통관번호를 덮어쓰지 못한다.
+        # 0-b) 통관번호 영역의 select/dropdown/radio/탭 중 '직접입력' 옵션을 선택.
+        #      11번가는 회원이 등록한 통관번호가 있으면 기본이 'KIM MINA' 같은
+        #      회원 정보가 선택돼있어 입력칸이 readonly 로 고정된다.
+        #      '직접입력' 으로 바꿔야 새 영문이름·통관번호가 입력 가능.
         try:
             switched = await page.evaluate(
                 r"""() => {
-                  // '개인통관고유부호' 섹션 안의 '입력' 라벨을 가진 radio/button 찾기
+                  // '개인통관고유부호' 섹션 안의 요소만 대상
                   function inCustomsSection(el) {
                     let p = el;
-                    for (let i = 0; p && i < 12; i++, p = p.parentElement) {
-                      const t = (p.innerText || p.textContent || '').slice(0, 200);
+                    for (let i = 0; p && i < 15; i++, p = p.parentElement) {
+                      const t = (p.innerText || p.textContent || '').slice(0, 300);
                       if (/개인통관|통관.*고유부호|통관번호/.test(t)) return true;
                     }
                     return false;
@@ -2632,56 +2633,87 @@ class OrderAutomation:
                     return false;
                   }
                   const out = [];
-                  // 1) label 안의 radio — 텍스트가 '입력' 이고 통관 섹션
-                  for (const lbl of document.querySelectorAll('label')) {
-                    const txt = (lbl.innerText || '').trim();
-                    if (!/^입력$|^직접\s*입력$/.test(txt)) continue;
-                    if (!inCustomsSection(lbl)) continue;
-                    const radio = lbl.querySelector('input[type="radio"]');
-                    if (radio && !radio.checked) {
-                      radio.checked = true;
-                      radio.dispatchEvent(new Event('change', {bubbles: true}));
-                      radio.dispatchEvent(new Event('click', {bubbles: true}));
-                      out.push('radio-checked');
+
+                  // 1) <select> 드롭다운 — 통관 섹션 안의 select 에서 '직접입력' option 선택
+                  for (const sel of document.querySelectorAll('select')) {
+                    if (!inCustomsSection(sel)) continue;
+                    let target = null;
+                    for (const opt of sel.options) {
+                      const ot = (opt.innerText || opt.textContent || '').trim();
+                      if (/^직접\s*입력$|^직접입력$|^입력$/.test(ot)) {
+                        target = opt;
+                        break;
+                      }
                     }
-                    if (fire(lbl)) out.push('label-clicked');
+                    if (target && sel.value !== target.value) {
+                      const setter = Object.getOwnPropertyDescriptor(
+                        HTMLSelectElement.prototype, 'value'
+                      )?.set;
+                      if (setter) setter.call(sel, target.value); else sel.value = target.value;
+                      sel.dispatchEvent(new Event('input', {bubbles: true}));
+                      sel.dispatchEvent(new Event('change', {bubbles: true}));
+                      out.push('select-direct:' + (sel.name || sel.id) + '=' + target.value);
+                    }
                   }
-                  // 2) radio 자체 — value 또는 인접 텍스트가 '입력'
+
+                  // 2) 11번가 커스텀 드롭다운 — <button>/<div role="combobox"> + 옵션 리스트
+                  //    버튼 텍스트가 'KIM MINA' 같은 회원 정보면 클릭해서 펼친 후
+                  //    '직접입력' 항목 클릭.
+                  for (const trig of document.querySelectorAll(
+                    'button, [role="combobox"], [role="button"], [class*="select" i], [class*="dropdown" i]'
+                  )) {
+                    if (!inCustomsSection(trig)) continue;
+                    const txt = (trig.innerText || '').trim();
+                    // '직접입력' 이미 표시중이면 skip
+                    if (/^직접\s*입력$|^직접입력$/.test(txt)) continue;
+                    // 너무 긴 텍스트(섹션 전체) 는 trigger 가 아님
+                    if (txt.length > 30) continue;
+                    // 후보: 영문 이름 패턴(알파벳 공백) 또는 'P'+숫자 가 trigger 텍스트
+                    if (!/^[A-Z][A-Z\s]+$|P\d{8,}/.test(txt)) continue;
+                    if (!fire(trig)) continue;
+                    out.push('trigger-clicked:' + txt.slice(0, 30));
+                  }
+                  // 펼쳐진 후 옵션에서 '직접입력' 클릭 시도
+                  for (const opt of document.querySelectorAll(
+                    '[role="option"], li, .option, [class*="option" i]'
+                  )) {
+                    const otx = (opt.innerText || '').trim();
+                    if (!/^직접\s*입력$|^직접입력$/.test(otx)) continue;
+                    if (!inCustomsSection(opt)) continue;
+                    // 화면에 보이는지 체크
+                    const cs = window.getComputedStyle(opt);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                    if (fire(opt)) {
+                      out.push('option-direct-clicked');
+                      break;
+                    }
+                  }
+
+                  // 3) radio 형태 — '직접입력' 라벨/value
                   for (const r of document.querySelectorAll('input[type="radio"]')) {
                     if (!inCustomsSection(r)) continue;
-                    const v = (r.value || '').toLowerCase();
                     const lbl = r.closest('label');
                     const lblTxt = lbl ? (lbl.innerText || '').trim() : '';
-                    const isInputOpt = /^입력$|^직접\s*입력$/.test(lblTxt) ||
-                                        /input|direct|new|nm/i.test(v);
-                    if (isInputOpt && !r.checked) {
-                      r.checked = true;
-                      r.dispatchEvent(new Event('change', {bubbles: true}));
-                      r.dispatchEvent(new Event('click', {bubbles: true}));
-                      out.push('radio-direct-checked:' + (r.name || r.id));
-                    }
-                  }
-                  // 3) tab/button 형태 — '입력' 텍스트 가진 버튼/탭/링크
-                  for (const sel of ['button', 'a', '[role="tab"]', '[role="button"]']) {
-                    for (const el of document.querySelectorAll(sel)) {
-                      const txt = (el.innerText || '').trim();
-                      if (!/^입력$|^직접\s*입력$/.test(txt)) continue;
-                      if (!inCustomsSection(el)) continue;
-                      // 이미 활성 상태(aria-selected/active class) 면 skip
-                      const cls = (el.className || '').toLowerCase();
-                      if (el.getAttribute('aria-selected') === 'true' ||
-                          /active|selected|on\b/.test(cls)) continue;
-                      if (fire(el)) out.push('tab-clicked:' + sel);
+                    const v = (r.value || '').toLowerCase();
+                    if (/^직접\s*입력$|^직접입력$|^입력$/.test(lblTxt) ||
+                        /direct|input|new/i.test(v)) {
+                      if (!r.checked) {
+                        r.checked = true;
+                        r.dispatchEvent(new Event('change', {bubbles: true}));
+                        r.dispatchEvent(new Event('click', {bubbles: true}));
+                        out.push('radio-direct:' + (r.name || r.id));
+                      }
                     }
                   }
                   return out;
                 }"""
             )
             if switched:
-                log.info(f"행{order.row}: 통관번호 '입력' 모드 전환: {switched}")
-                await asyncio.sleep(0.3)
+                log.info(f"행{order.row}: 통관번호 '직접입력' 전환: {switched}")
+                # select 변경 후 input 이 활성화되기까지 살짝 대기
+                await asyncio.sleep(0.4)
         except Exception as exc:
-            log.debug(f"통관 '입력' 모드 전환 실패: {exc}")
+            log.debug(f"통관 '직접입력' 전환 실패: {exc}")
 
         # 1) 셀렉터 경로
         filled = False
