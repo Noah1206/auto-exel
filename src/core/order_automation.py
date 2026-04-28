@@ -271,41 +271,33 @@ class OrderAutomation:
         # 현재 행에 연결된 페이지가 있으면 우선 사용
         page = self._pages.get(order.row)
 
-        # 없으면 orphan 페이지(이전 행이 두고 간 탭) → 다른 행의 탭 순으로 인수인계
+        # 없으면 orphan 페이지(abandon() 이 남긴 탭) 만 인수인계.
+        # 주의: 다른 살아있는 행의 탭은 절대 빼앗으면 안 됨 — 병렬 진행 중인
+        #       다른 결제/주문서가 닫혀버리는 사고 발생.
         if page is None or page.is_closed():
-            donor_row = None
             donor_page = None
-            # 1순위: abandon() 이 남긴 orphan 페이지
             orphan = self._pages.get(-1)
             if orphan is not None and not orphan.is_closed():
-                donor_row = -1
                 donor_page = orphan
-            else:
-                # 2순위: 다른 row 에 남아있는 살아있는 탭
-                for r, p in list(self._pages.items()):
-                    if r != order.row and p and not p.is_closed():
-                        donor_row = r
-                        donor_page = p
-                        break
 
             if donor_page is not None:
-                # 이전 행의 페이지를 현재 행으로 인수인계
+                # orphan(주인 없는) 탭만 인수인계
                 self._pages[order.row] = donor_page
-                self._pages.pop(donor_row, None)
-                self._checkpoints.pop(donor_row, None)
-                # 샵백 모니터도 이전 행의 것을 종료하고 새로 붙임
-                stale_monitor = self._shopback_monitors.pop(donor_row, None)
+                self._pages.pop(-1, None)
+                self._checkpoints.pop(-1, None)
+                stale_monitor = self._shopback_monitors.pop(-1, None)
                 if stale_monitor:
                     try:
                         stale_monitor.stop()
                     except Exception:
                         pass
                 page = donor_page
-                log.debug(f"행{donor_row} → 행{order.row} 탭 인수인계 (포커스 유지)")
+                log.debug(f"orphan 탭 → 행{order.row} 인수인계")
             else:
-                # 정말 탭이 없을 때만 새로 만든다 (첫 행이거나 브라우저 재시작 후)
+                # orphan 도 없으면 항상 새 탭. 병렬 진행 중인 다른 행의 탭은 건드리지 않음.
                 page = await self.browser.new_page()
                 self._pages[order.row] = page
+                log.info(f"행{order.row}: 새 탭 생성 (병렬 진행 안전 모드)")
 
             self._checkpoints[order.row] = Checkpoint.START
             if getattr(self.config, "verify_shopback", True) and order.row not in self._shopback_monitors:
