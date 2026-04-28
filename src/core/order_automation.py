@@ -1431,7 +1431,10 @@ class OrderAutomation:
         # 2~3) 팝업 감지 여부와 무관하게 자동 검색 + 결과 선택 시도.
         # popup_open=False 라도 별도 창/iframe 어딘가에는 있을 수 있어서.
         try:
-            query = order.address_search_query() or order.postal_code
+            # 검색어는 우편번호 우선 — 5자리 숫자라 도로명·지번 변형에 휘둘리지 않고
+            # 11번가 주소찾기 popup 이 가장 안정적으로 결과를 반환한다.
+            # 우편번호가 비어있을 때만 도로명·지번 텍스트로 fallback.
+            query = order.postal_code or order.address_search_query()
             log.info(
                 f"행{order.row}: 주소찾기 검색·선택 시작 query={query!r} "
                 f"postal={order.postal_code!r}"
