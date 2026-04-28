@@ -1332,11 +1332,10 @@ class OrderAutomation:
           5) 우편/기본주소도 비어있으면 JS 강제 주입 (안전망)
         """
         # 1) 주소찾기 버튼 자동 클릭 (팝업이 이미 떠있으면 스킵)
+        # 즉응형 전략: popup 'page' 이벤트 + 50ms 간격 polling 을 동시에 race.
+        # 둘 중 먼저 팝업을 잡는 쪽이 이김 → 팝업이 뜨는 그 즉시 다음 단계로 진입.
         popup_open = await self._is_address_popup_open(page)
         if not popup_open:
-            # popup window 가 열리는 이벤트를 미리 listener 로 등록 → 클릭 직후
-            # ctx.pages 에 안 보여도 'page' 이벤트로 즉시 잡을 수 있다.
-            # Windows 에서 child window 가 별도 프로세스로 분리되는 케이스 대응.
             ctx = page.context
             popup_future: asyncio.Future = asyncio.get_event_loop().create_future()
 
@@ -1348,33 +1347,54 @@ class OrderAutomation:
             try:
                 clicked = await self._click_address_search_button(page)
                 if clicked:
-                    # 1) 이벤트로 popup 잡기 시도 (최대 6초)
-                    try:
-                        new_p = await asyncio.wait_for(popup_future, timeout=6.0)
-                        log.info(
-                            f"행{order.row}: 주소찾기 popup 이벤트 감지 → "
-                            f"URL={new_p.url[:80]}"
-                        )
-                        try:
-                            await new_p.wait_for_load_state(
-                                "domcontentloaded", timeout=3000
-                            )
-                        except Exception:
-                            pass
-                        popup_open = True
-                    except asyncio.TimeoutError:
-                        # 2) 이벤트 못 잡았으면 polling fallback
-                        for _ in range(30):
-                            await asyncio.sleep(0.2)
+                    # 50ms 간격 polling 으로 popup_open 도 동시에 감시.
+                    # 'page' 이벤트가 늦게 와도 polling 이 먼저 잡으면 즉시 진입.
+                    # 최대 20초까지 기다리되, 잡히는 그 순간 break.
+                    async def _poll_open() -> bool:
+                        for _ in range(400):  # 50ms * 400 = 20s
                             if await self._is_address_popup_open(page):
-                                popup_open = True
-                                log.info(f"행{order.row}: 주소찾기 팝업 polling 감지됨")
-                                break
+                                return True
+                            await asyncio.sleep(0.05)
+                        return False
+
+                    poll_task = asyncio.create_task(_poll_open())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {popup_future, poll_task},
+                            timeout=20.0,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if popup_future in done:
+                            new_p = popup_future.result()
+                            log.info(
+                                f"행{order.row}: 주소찾기 popup 이벤트 즉시 감지 → "
+                                f"URL={new_p.url[:80]}"
+                            )
+                            popup_open = True
+                            # domcontentloaded 까지만 짧게 — load 까지는 안 기다림
+                            try:
+                                await new_p.wait_for_load_state(
+                                    "domcontentloaded", timeout=2000
+                                )
+                            except Exception:
+                                pass
+                        elif poll_task in done and poll_task.result():
+                            popup_open = True
+                            log.info(
+                                f"행{order.row}: 주소찾기 팝업 polling 즉시 감지"
+                            )
                         else:
                             log.warning(
-                                f"행{order.row}: 주소찾기 팝업이 12초 내 감지되지 않음 — "
+                                f"행{order.row}: 주소찾기 팝업이 20초 내 감지되지 않음 — "
                                 "그래도 자동 검색·선택 시도"
                             )
+                    finally:
+                        if not poll_task.done():
+                            poll_task.cancel()
+                            try:
+                                await poll_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
             finally:
                 try:
                     ctx.remove_listener("page", _on_new_page)
@@ -1815,19 +1835,20 @@ class OrderAutomation:
                 pass
 
             # 1) 검색창 등장 대기 + 검색 실행 — 최대 3회 재시도
+            # 100ms 간격 polling 으로 검색창이 잡히는 그 즉시 입력 + 검색 실행.
             search_ok = False
             for search_attempt in range(3):
-                # 검색창이 나타날 때까지 polling (최대 8초)
+                # 검색창이 나타날 때까지 polling (최대 15초 — 팝업 로드 늦어도 OK)
                 input_ready = False
-                for _ in range(40):
+                for _ in range(150):
                     try:
                         r = await target.evaluate(search_js, [query])
                     except Exception as exc:
                         log.debug(f"search_js 실패: {exc}")
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.1)
                         continue
                     if r == 'no-input':
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.1)
                         continue
                     log.info(
                         f"주소찾기 검색 결과 (시도 {search_attempt + 1}/3): {r}"
@@ -1836,7 +1857,7 @@ class OrderAutomation:
                     search_ok = True
                     break
                 if not input_ready:
-                    log.warning(f"주소찾기 검색창이 8초 내 안 잡힘 (재시도 {search_attempt + 1}/3)")
+                    log.warning(f"주소찾기 검색창이 15초 내 안 잡힘 (재시도 {search_attempt + 1}/3)")
                     return False
 
                 # 2) 결과 등장 + 선택 polling (최대 15초)
@@ -1872,19 +1893,20 @@ class OrderAutomation:
             log.warning("주소찾기 결과 선택 최종 실패")
             return False
 
-        # 1) 별도 popup window — 늦게 뜰 수 있어 최대 8초 polling 으로 대기
+        # 1) 별도 popup window — 50ms 간격 polling 으로 즉응 (최대 20초)
+        # 발견 즉시 break → 검색 단계로 진입.
         popup_pages: list[Page] = []
-        for _ in range(40):
+        for _ in range(400):  # 50ms * 400 = 20s
             popup_pages = await self._find_address_popup_pages(page)
             if popup_pages:
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.05)
 
         for popup_page in popup_pages:
+            # domcontentloaded 까지만 짧게 — load 완료는 검색 polling 이 처리.
             try:
-                # popup 이 완전 로드되기까지 대기 (timeout 5초로 확장)
                 await popup_page.wait_for_load_state(
-                    "domcontentloaded", timeout=5000
+                    "domcontentloaded", timeout=2000
                 )
             except Exception:
                 pass
