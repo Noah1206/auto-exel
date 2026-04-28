@@ -2068,7 +2068,63 @@ class OrderAutomation:
                     return True
             return False
 
-        # 1차 시도
+        # 0) 가장 확실한 직접 주입 — 11번가 ordEngNm / engNm 류 input 을
+        #    selector 매칭 없이 JS 로 즉시 찾아 강제 주입. 통관번호 단계가 폼을
+        #    재렌더하더라도 영문이름 단계 끝에 한 번 더 채워서 안전망 확보.
+        try:
+            direct_ok = await page.evaluate(
+                r"""
+([fullName, firstName, lastName]) => {
+  function setVal(el, v) {
+    try { el.removeAttribute('readonly'); } catch(e){}
+    try { el.removeAttribute('disabled'); } catch(e){}
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, 'value'
+    )?.set;
+    if (setter) setter.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.dispatchEvent(new Event('blur', {bubbles: true}));
+  }
+  const sels = [
+    'input[name="ordEngNm"]', 'input#ordEngNm',
+    'input[name="engNm"]', 'input#engNm',
+    'input[name="rcvrEngNm"]',
+    'input[name="prsnEngNm"]', 'input#prsnEngNm',
+    'input[name="psnEngNm"]', 'input#psnEngNm',
+  ];
+  const touched = [];
+  for (const s of sels) {
+    for (const el of document.querySelectorAll(s)) {
+      const t = (el.type||'').toLowerCase();
+      if (['hidden','checkbox','radio','submit','button'].includes(t)) continue;
+      setVal(el, fullName);
+      touched.push(s);
+    }
+  }
+  // first/last 분리 input
+  if (firstName) {
+    for (const el of document.querySelectorAll(
+      'input[name="engFirstNm"], input[name="ordEngFirstNm"]'
+    )) { setVal(el, firstName); touched.push('first'); }
+  }
+  if (lastName) {
+    for (const el of document.querySelectorAll(
+      'input[name="engLastNm"], input[name="ordEngLastNm"]'
+    )) { setVal(el, lastName); touched.push('last'); }
+  }
+  return touched;
+}
+""",
+                [eng_name, first, last],
+            )
+            if direct_ok:
+                log.info(f"영문이름 직접 selector 주입 성공: {direct_ok}")
+                return
+        except Exception as exc:
+            log.debug(f"영문이름 직접 주입 시도 실패: {exc}")
+
+        # 1차 시도 (selector 매칭 경유)
         if await _try_once():
             return
 
