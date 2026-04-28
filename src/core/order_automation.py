@@ -1263,20 +1263,21 @@ class OrderAutomation:
         await self._force_fill(
             page, "order_page.zipcode_input", order.postal_code, delay
         )
-        # 주소 입력 정책 (안전 우선):
-        #  - base 칸: 주소찾기 팝업이 채워줌 (행정 표준 도로명/지번)
-        #  - detail 칸: 원본 주소 전체 그대로 → 정보 손실 0
-        #  - 주소찾기 실패 시: base 에도 원본 전체 들어가 있어 최소 정보 보장
-        addr_full = order.address
+        # 주소 입력 정책:
+        #  - base 칸: 도로명+번지수까지 (주소찾기 팝업이 행정 표준값으로 덮어씀)
+        #  - detail 칸: 아파트명/동/호 등 나머지 (분리 못 하면 원본 전체)
+        #  - 분리 규칙: 첫 번지수(숫자[-숫자]) 까지 base, 나머지 detail
+        addr_base = order.address_base()
+        addr_detail = order.address_detail() or order.address
         log.info(
-            f"행{order.row}: 주소 입력 — base(임시)={addr_full!r} detail={addr_full!r}"
-            f" (주소찾기 후 base 는 자동 갱신됨)"
+            f"행{order.row}: 주소 입력 — base={addr_base!r} detail={addr_detail!r}"
+            f" (주소찾기 후 base 는 행정표준으로 자동 갱신됨)"
         )
         await self._force_fill(
-            page, "order_page.address_base", addr_full, delay
+            page, "order_page.address_base", addr_base, delay
         )
         await self._force_fill(
-            page, "order_page.address_detail", addr_full, delay
+            page, "order_page.address_detail", addr_detail, delay
         )
 
         # 2-b) 주소찾기 팝업 자동 처리
@@ -1914,9 +1915,10 @@ class OrderAutomation:
         - placeholder/name/id/aria-label 어디든 매칭되면 주입
         - input/change 이벤트 dispatch (React/Vue 의 controlled input 도 동작)
         """
-        # detail 에 원본 주소 전체. base 도 우선 원본 주소(주소찾기가 갱신).
-        addr_base = order.address
-        addr_detail = order.address
+        # base = 도로명+번지수까지, detail = 아파트명/동/호 등 나머지.
+        # 분리 못하면 detail 에 원본 전체 (정보 손실 방지).
+        addr_base = order.address_base()
+        addr_detail = order.address_detail() or order.address
         try:
             touched = await page.evaluate(
                 r"""([postal, baseAddr, detailAddr]) => {
@@ -2257,14 +2259,15 @@ class OrderAutomation:
             )
         await asyncio.sleep(0.5)
 
-        # 4) 두번째 주소칸(상세주소)에 수취인 주소 전체 입력
-        if order.address and await self.selectors.exists(
+        # 4) 상세주소칸 — 아파트명/동/호 등만 입력 (도로명+번지는 base 칸에 이미 채워짐)
+        addr_detail = order.address_detail() or order.address
+        if addr_detail and await self.selectors.exists(
             page, "order_page.address_detail", timeout_ms=1500
         ):
             await self._force_fill(
-                page, "order_page.address_detail", order.address, delay
+                page, "order_page.address_detail", addr_detail, delay
             )
-            log.info(f"행{order.row}: 상세주소칸에 수취인 주소 전체 입력 완료")
+            log.info(f"행{order.row}: 상세주소 입력 완료 — {addr_detail!r}")
 
     async def _pick_best_zipcode_result(
         self, page: Page, target_address: str
