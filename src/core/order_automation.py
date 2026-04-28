@@ -3229,14 +3229,22 @@ class OrderAutomation:
             ) from exc
 
         # 1) 주문번호 추출 — 셀렉터 → 실패시 JS 페이지 텍스트 정규식 fallback
+        # 주문번호는 8자리 이상 숫자/하이픈만 인정. "주문상세보기" 같은 텍스트는 절대 저장 X
+        import re as _re
+        ORDER_NO_RE = _re.compile(r"[\d\-]{8,}")
         order_no: str | None = None
         try:
             text = await self.selectors.get_text(
                 page, "confirmation.order_number", timeout_ms=5000
             )
-            import re
-            match = re.search(r"[\d\-]{8,}", text)
-            order_no = match.group(0) if match else text.strip()
+            match = ORDER_NO_RE.search(text or "")
+            if match:
+                order_no = match.group(0)
+            else:
+                log.warning(
+                    f"주문번호 셀렉터가 잡았으나 숫자 패턴 없음: text={text!r} "
+                    "→ JS fallback 으로 재시도"
+                )
         except ElementNotFoundError:
             log.warning(
                 "주문번호 셀렉터 매칭 실패 → 페이지 텍스트에서 패턴 검색"
@@ -3261,6 +3269,17 @@ class OrderAutomation:
                 )
             except Exception as exc:
                 log.warning(f"JS 주문번호 추출 실패: {exc}")
+
+        # 최종 안전장치: 어떤 경로로 들어왔든 숫자 패턴 매칭이 안 되면 거부.
+        if order_no:
+            final_match = ORDER_NO_RE.search(order_no)
+            if not final_match:
+                log.warning(
+                    f"주문번호 검증 실패 ('숫자/하이픈 8자리+' 아님): {order_no!r} → 거부"
+                )
+                order_no = None
+            else:
+                order_no = final_match.group(0)
 
         if not order_no:
             raise ElementNotFoundError(

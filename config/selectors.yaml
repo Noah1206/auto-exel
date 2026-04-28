@@ -317,7 +317,8 @@ confirmation:
     - 'dd.order_no'
     - 'em.order_number'
     - '.c_order_number'
-    - 'a[href*="orderDetail"]'
+    # 'a[href*="orderDetail"]' 는 "주문상세보기" 링크 텍스트를 잡아버려 제거.
+    # 주문번호는 반드시 텍스트가 숫자 패턴이어야 함.
     - 'a[href*="OrderDetail"]'
     - ':text("주문번호") + *'
     - ':text("주문번호") ~ strong'
