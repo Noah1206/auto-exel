@@ -1543,40 +1543,79 @@ class OrderAutomation:
                 return True
         except Exception:
             pass
-        # 2) 별도 popup window — context 의 다른 page 중 주소찾기 URL
+        # 2) 별도 popup window — 다른 행 점유 탭은 제외, opener 가 page 인 것만
         try:
             ctx = page.context
+            owned_pages = set()
+            for r, p2 in self._pages.items():
+                if p2 is not None and p2 is not page:
+                    owned_pages.add(p2)
             for p in ctx.pages:
                 if p is page or p.is_closed():
                     continue
+                if p in owned_pages:
+                    continue
                 url = p.url or ""
                 if "/addr/" in url or "searchAddr" in url or "zipcode" in url.lower():
+                    try:
+                        opener = await p.opener()
+                    except Exception:
+                        opener = None
+                    if opener is not None and opener is not page:
+                        continue
                     return True
         except Exception:
             pass
         return False
 
     async def _find_address_popup_pages(self, page: Page) -> list[Page]:
-        """주소찾기 별도 창으로 떠 있는 page 들을 모두 반환."""
+        """주소찾기 별도 창으로 떠 있는 page 들을 반환.
+
+        병렬 진행 안전: opener 가 page (= 이 행의 주문서) 인 popup 만 인정.
+        다른 행의 주소찾기 popup 을 가로채지 않는다.
+        Windows 에서 opener() 가 일시적으로 None 반환할 수 있어
+        opener 정보 없으면 '다른 행 소유 탭이 아닌 경우' 로 fallback 허용.
+        """
         out: list[Page] = []
         try:
             ctx = page.context
+            # 다른 행이 점유 중인 page 들 — 이건 주소찾기 popup 일 리 없으니 제외용
+            owned_pages = set()
+            for r, p in self._pages.items():
+                if p is not None and p is not page:
+                    owned_pages.add(p)
+
             all_urls = []
             for p in ctx.pages:
                 if p is page or p.is_closed():
                     continue
+                if p in owned_pages:
+                    continue  # 다른 행의 주문서/페이지
                 url = (p.url or "").lower()
                 all_urls.append(url[:80])
                 # 11번가 주소찾기 popup URL 패턴 (소문자 비교)
-                if (
+                is_addr_url = (
                     "/addr/" in url
                     or "searchaddr" in url
                     or "zipcode" in url
-                    or "post" in url
                     or "popup" in url
-                    or "주소" in url  # 한글 URL 가능성
-                ):
-                    out.append(p)
+                )
+                if not is_addr_url:
+                    continue
+                # opener 검사 — 가능한 경우 page 가 직접 연 popup 만 인정
+                try:
+                    opener = await p.opener()
+                except Exception:
+                    opener = None
+                # opener=page → 확실히 이 행의 popup
+                # opener=None → Windows 에서 일시적 None 가능 → URL 매칭만으로 통과
+                # opener=다른 page → 다른 행의 popup → 제외
+                if opener is not None and opener is not page:
+                    log.debug(
+                        f"_find_address_popup_pages: opener 다름 → skip ({url[:60]})"
+                    )
+                    continue
+                out.append(p)
             log.info(
                 f"_find_address_popup_pages: 컨텍스트 page 개수={len(ctx.pages)}, "
                 f"매칭={len(out)}, 다른 page URL들={all_urls}"
