@@ -104,8 +104,14 @@ class MainWindow(QMainWindow):
         self._runner = AsyncRunner(name="PlaywrightRunner")
         self._runner.start()
         self._scraper: PriceScraper | None = None
-        # 동시 실행 방지용 단순 플래그 (UI 스레드에서만 set/clear)
+        # 전역 동시 실행 방지용 플래그 (브라우저 열기/샵백/가격조회/전체주문 등
+        # 충돌 위험 작업에만 사용). 단건 주문은 행별로 _busy_rows 로 분리 관리.
         self._busy = False
+        # 병렬 진행 중인 단건 주문 행 번호 집합 (UI 스레드에서만 read/write)
+        self._busy_rows: set[int] = set()
+        # 엑셀 저장 직렬화용 락 — 동시 save() 가 같은 파일에 쓰는 충돌 방지
+        from threading import Lock
+        self._excel_save_lock = Lock()
         # 주문 중단 플래그 — 중단 버튼/단축키로 set, 루프에서 체크하여 조기 종료
         self._abort_requested = False
         # 중단 요청 후 3초 경과 시 '강제 중단' 모드로 진입 (Future cancel)
@@ -707,7 +713,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "알림", "먼저 엑셀을 불러와주세요.")
             return
         try:
-            out = self.excel_mgr.save(self.model.all_rows())
+            with self._excel_save_lock:
+                out = self.excel_mgr.save(self.model.all_rows())
             self.statusBar().showMessage(f"저장 완료: {out.name}")
             log.info(f"저장: {out}")
             QMessageBox.information(
@@ -736,7 +743,8 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         try:
-            out = self.excel_mgr.save_to_original(self.model.all_rows())
+            with self._excel_save_lock:
+                out = self.excel_mgr.save_to_original(self.model.all_rows())
             self.statusBar().showMessage(f"원본 저장: {out.name}")
             log.info(f"원본 저장: {out}")
             QMessageBox.information(self, "저장 완료", f"원본에 저장되었습니다.\n\n{out}")
@@ -1007,7 +1015,8 @@ class MainWindow(QMainWindow):
             )
             # 스크랩 결과는 진행 콜백으로 이미 모델에 반영됨.
             if self.excel_mgr:
-                self.excel_mgr.save(self.model.all_rows())
+                with self._excel_save_lock:
+                    self.excel_mgr.save(self.model.all_rows())
             self._ui(lambda: (
                 self.statusBar().showMessage("가격 조회 완료 — 저장 가능합니다"),
                 self._refresh_summary(),
@@ -1059,15 +1068,20 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
-        if not self._try_acquire():
+        # 행 단위 lock — 같은 행만 막고, 다른 행은 병렬 진행 가능
+        if not self._try_acquire_row(order.row):
             return
         # 즉각 시각 피드백: 더블클릭 직후 행 상태를 '진행중' 으로 변경 → 스피너 회전
         order.status = "in_progress"
         order.error_message = None
         self.model.update_order(order)
         self.statusBar().showMessage(f"행 {order.row} 주문 시작 중...", 3000)
-        # 단건 주문도 가격 가드 적용
-        self._run_async(self._run_single_order_with_guard(order))
+        # 단건 주문도 가격 가드 적용. 끝나면 행 lock 해제.
+        target_row = order.row
+        self._run_async(
+            self._run_single_order_with_guard(order),
+            on_done=lambda _f, r=target_row: self._release_row(r),
+        )
 
     async def _run_single_order_with_guard(self, order: Order) -> None:
         # 토탈가격이 비어있으면 묻지 말고 바로 조회 진행
@@ -1300,9 +1314,11 @@ class MainWindow(QMainWindow):
             if order.status == "completed":
                 ok_count += 1
                 # 주문 성공 직후 즉시 엑셀 저장 — 주문번호/토탈가격 유실 방지
+                # 병렬 단건 주문과 충돌 방지를 위해 락으로 직렬화
                 if self.excel_mgr:
                     try:
-                        self.excel_mgr.save(self.model.all_rows())
+                        with self._excel_save_lock:
+                            self.excel_mgr.save(self.model.all_rows())
                         log.info(
                             f"행{order.row} 엑셀 저장: 주문번호={order.order_number} "
                             f"토탈가격={order.total_price}"
@@ -1338,7 +1354,8 @@ class MainWindow(QMainWindow):
         self._ui(lambda: self._focus_active_row(None))
         if self.excel_mgr:
             try:
-                self.excel_mgr.save(self.model.all_rows())
+                with self._excel_save_lock:
+                    self.excel_mgr.save(self.model.all_rows())
             except Exception as exc:
                 log.warning(f"최종 저장 실패: {exc}")
 
@@ -1409,9 +1426,11 @@ class MainWindow(QMainWindow):
             if self.excel_mgr:
                 self.excel_mgr.update_order(order)
                 # 단건 주문도 완료 즉시 디스크 저장 — 주문번호/토탈가격 유실 방지
+                # 병렬 진행 중인 다른 행의 save() 와 충돌 방지를 위해 락으로 직렬화
                 if order.status == "completed":
                     try:
-                        self.excel_mgr.save(self.model.all_rows())
+                        with self._excel_save_lock:
+                            self.excel_mgr.save(self.model.all_rows())
                         log.info(
                             f"행{order.row} 엑셀 저장: 주문번호={order.order_number} "
                             f"토탈가격={order.total_price}"
@@ -1645,7 +1664,13 @@ class MainWindow(QMainWindow):
             order.status = "pending"
             order.error_message = None
             self.model.update_order(order)
-            self._run_async(self._run_single_order_with_guard(order))
+            # 행별 lock 으로 병렬 진행 허용
+            if self._try_acquire_row(order.row):
+                target_row = order.row
+                self._run_async(
+                    self._run_single_order_with_guard(order),
+                    on_done=lambda _f, r=target_row: self._release_row(r),
+                )
         elif action is skip:
             order.status = "completed"
             self.model.update_order(order)
@@ -1920,10 +1945,14 @@ class MainWindow(QMainWindow):
         except Exception:
             coro_name = "<coro>"
         log.debug(f"_run_async 시작: {coro_name}")
+        # 전역 작업 (브라우저/샵백/가격조회/전체주문) 만 _busy/_current_future 로 추적.
+        # 행단위 단건 주문은 _busy_rows 로만 추적 — 동시 진행 가능해야 하므로
+        # 전역 future 슬롯을 차지하지 않는다.
+        is_global = self._busy
         fut = self._runner.submit(coro)
-        # 강제 중단 시 cancel 대상으로 쓰기 위해 현재 실행 중인 Future 를 저장.
-        self._current_future = fut
-        self._current_future_name = coro_name
+        if is_global:
+            self._current_future = fut
+            self._current_future_name = coro_name
 
         def _bridge(f: Future) -> None:
             # add_done_callback 은 백그라운드 스레드에서 실행되므로,
@@ -1935,21 +1964,40 @@ class MainWindow(QMainWindow):
                 except Exception as exc:
                     log.exception(f"async 콜백 오류: {exc}")
                 finally:
-                    # 어떤 작업이든 끝나면 busy 해제 (UI 스레드)
-                    self._busy = False
-                    # 주문하기 버튼을 "주문하기" 로 복귀 + 플래그 리셋
-                    try:
-                        self._set_orders_button_running(False)
-                    except Exception:
-                        pass
-                    self._abort_requested = False
-                    self._force_abort_armed = False
-                    if self._current_future is f:
-                        self._current_future = None
+                    # 전역 작업이 끝났을 때만 전역 상태/버튼 복구.
+                    # 행단위 작업 종료는 _release_row 가 on_done 으로 처리.
+                    if is_global:
+                        self._busy = False
+                        try:
+                            self._set_orders_button_running(False)
+                        except Exception:
+                            pass
+                        self._abort_requested = False
+                        self._force_abort_armed = False
+                        if self._current_future is f:
+                            self._current_future = None
             QTimer.singleShot(0, _emit)
 
         fut.add_done_callback(_bridge)
         return fut
+
+    def _try_acquire_row(self, row: int) -> bool:
+        """행별 동시 실행 방지. True 면 이번 행 시작 가능, False 면 거절.
+
+        같은 행을 두 번 누르는 건 막지만, 다른 행은 병렬로 진행 가능.
+        품절/취소 등으로 한 행이 멈춰도 다른 행을 시작할 수 있게 한다.
+        """
+        if row in self._busy_rows:
+            self.statusBar().showMessage(
+                f"행 {row} 은(는) 이미 진행 중입니다 (다른 행은 동시 진행 가능)", 3500
+            )
+            return False
+        self._busy_rows.add(row)
+        return True
+
+    def _release_row(self, row: int) -> None:
+        """행 단위 lock 해제. 콜백/finally 에서 호출."""
+        self._busy_rows.discard(row)
 
     def _try_acquire(self) -> bool:
         """동시 실행 방지. True 면 이번 작업 시작 가능, False 면 거절.
