@@ -2608,6 +2608,81 @@ class OrderAutomation:
         except Exception:
             pass
 
+        # 0-b) "입력 / 선택" 토글이 '선택' 으로 되어있으면 '입력' 으로 강제 전환.
+        #      11번가는 회원이 등록한 통관번호가 있으면 기본이 '선택' 이라
+        #      그 위에 새 영문이름·통관번호를 덮어쓰지 못한다.
+        try:
+            switched = await page.evaluate(
+                r"""() => {
+                  // '개인통관고유부호' 섹션 안의 '입력' 라벨을 가진 radio/button 찾기
+                  function inCustomsSection(el) {
+                    let p = el;
+                    for (let i = 0; p && i < 12; i++, p = p.parentElement) {
+                      const t = (p.innerText || p.textContent || '').slice(0, 200);
+                      if (/개인통관|통관.*고유부호|통관번호/.test(t)) return true;
+                    }
+                    return false;
+                  }
+                  function fire(el) {
+                    try { el.click(); return true; } catch(e) {}
+                    try {
+                      el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                      return true;
+                    } catch(e) {}
+                    return false;
+                  }
+                  const out = [];
+                  // 1) label 안의 radio — 텍스트가 '입력' 이고 통관 섹션
+                  for (const lbl of document.querySelectorAll('label')) {
+                    const txt = (lbl.innerText || '').trim();
+                    if (!/^입력$|^직접\s*입력$/.test(txt)) continue;
+                    if (!inCustomsSection(lbl)) continue;
+                    const radio = lbl.querySelector('input[type="radio"]');
+                    if (radio && !radio.checked) {
+                      radio.checked = true;
+                      radio.dispatchEvent(new Event('change', {bubbles: true}));
+                      radio.dispatchEvent(new Event('click', {bubbles: true}));
+                      out.push('radio-checked');
+                    }
+                    if (fire(lbl)) out.push('label-clicked');
+                  }
+                  // 2) radio 자체 — value 또는 인접 텍스트가 '입력'
+                  for (const r of document.querySelectorAll('input[type="radio"]')) {
+                    if (!inCustomsSection(r)) continue;
+                    const v = (r.value || '').toLowerCase();
+                    const lbl = r.closest('label');
+                    const lblTxt = lbl ? (lbl.innerText || '').trim() : '';
+                    const isInputOpt = /^입력$|^직접\s*입력$/.test(lblTxt) ||
+                                        /input|direct|new|nm/i.test(v);
+                    if (isInputOpt && !r.checked) {
+                      r.checked = true;
+                      r.dispatchEvent(new Event('change', {bubbles: true}));
+                      r.dispatchEvent(new Event('click', {bubbles: true}));
+                      out.push('radio-direct-checked:' + (r.name || r.id));
+                    }
+                  }
+                  // 3) tab/button 형태 — '입력' 텍스트 가진 버튼/탭/링크
+                  for (const sel of ['button', 'a', '[role="tab"]', '[role="button"]']) {
+                    for (const el of document.querySelectorAll(sel)) {
+                      const txt = (el.innerText || '').trim();
+                      if (!/^입력$|^직접\s*입력$/.test(txt)) continue;
+                      if (!inCustomsSection(el)) continue;
+                      // 이미 활성 상태(aria-selected/active class) 면 skip
+                      const cls = (el.className || '').toLowerCase();
+                      if (el.getAttribute('aria-selected') === 'true' ||
+                          /active|selected|on\b/.test(cls)) continue;
+                      if (fire(el)) out.push('tab-clicked:' + sel);
+                    }
+                  }
+                  return out;
+                }"""
+            )
+            if switched:
+                log.info(f"행{order.row}: 통관번호 '입력' 모드 전환: {switched}")
+                await asyncio.sleep(0.3)
+        except Exception as exc:
+            log.debug(f"통관 '입력' 모드 전환 실패: {exc}")
+
         # 1) 셀렉터 경로
         filled = False
         if await self.selectors.exists(page, "order_page.customs_id", timeout_ms=1500):
