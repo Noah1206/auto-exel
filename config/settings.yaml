@@ -25,7 +25,7 @@ automation:
 price_scraper:
   concurrent: 5
   per_product_timeout_ms: 6000
-  inter_request_delay_ms: 200
+  inter_request_delay_ms: 0
 excel:
   auto_save: true
   backup_on_load: true

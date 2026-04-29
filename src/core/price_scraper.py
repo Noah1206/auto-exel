@@ -176,10 +176,8 @@ class PriceScraper:
                             on_progress(cur, total, order)
                         except Exception:
                             pass
-                    # 동시성이 너무 높을 때 11번가 부하 완화용 짧은 딜레이
-                    delay_ms = getattr(self.config, "inter_request_delay_ms", 0) or 0
-                    if delay_ms > 0:
-                        await asyncio.sleep(delay_ms / 1000)
+                    # inter_request_delay_ms 는 무시한다 — 가격 결과를 즉시 엑셀에
+                    # 반영하기 위해 워커 사이의 인위적 지연을 제거.
 
         tasks = [
             asyncio.create_task(_worker(i, order))

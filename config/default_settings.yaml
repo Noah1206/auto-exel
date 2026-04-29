@@ -23,7 +23,7 @@ automation:
 price_scraper:
   concurrent: 5                    # 동시 5개 (병렬 스크랩)
   per_product_timeout_ms: 6000
-  inter_request_delay_ms: 200
+  inter_request_delay_ms: 0        # 워커 사이 인위적 지연 제거 (즉시 반영용)
 
 excel:
   auto_save: true

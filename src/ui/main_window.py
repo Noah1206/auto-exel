@@ -1001,19 +1001,30 @@ class MainWindow(QMainWindow):
             )
 
             def progress(current: int, total: int, order: Order) -> None:
-                # 백그라운드 스레드에서 호출됨 — UI 변경은 메인 스레드로 마샬링
+                # 백그라운드 스레드에서 호출됨 — UI 변경은 메인 스레드로 마샬링.
+                # 엑셀 저장은 워커 스레드에서 즉시 수행하여 가격 결과가
+                # 들어오는 즉시 디스크에 반영되도록 한다 (sleep/배치 대기 없음).
                 cur, tot = current, total
                 ord_ = order
                 self._ui(lambda: (
                     self.model.update_order(ord_),
+                    self._reveal_price_cell(ord_.row),
                     self.statusBar().showMessage(f"가격 조회 중: {cur}/{tot}"),
                 ))
+                if self.excel_mgr:
+                    try:
+                        self.excel_mgr.update_order(ord_)
+                        with self._excel_save_lock:
+                            self.excel_mgr.save(self.excel_mgr.rows)
+                    except Exception as exc:
+                        log.warning(f"가격 즉시 저장 실패 (행 {ord_.row}): {exc}")
 
             scrape_list = targets if targets is not None else self.model.valid_orders()
             await self._scraper.scrape_all(
                 scrape_list, on_progress=progress, only_missing=only_missing
             )
-            # 스크랩 결과는 진행 콜백으로 이미 모델에 반영됨.
+            # 스크랩 결과는 진행 콜백에서 이미 즉시 디스크에 저장됨.
+            # 마지막에 한 번 더 저장해 누락된 행이 없도록 보강.
             if self.excel_mgr:
                 with self._excel_save_lock:
                     self.excel_mgr.save(self.model.all_rows())
@@ -2360,6 +2371,27 @@ class MainWindow(QMainWindow):
                 idx = self.model.index(i, 0)
                 self.table.scrollTo(idx, self.table.PositionAtCenter)
                 break
+
+    def _reveal_price_cell(self, excel_row: int) -> None:
+        """가격이 갱신된 행의 '토탈가격' 셀이 화면에 항상 보이도록 스크롤.
+
+        가격 조회 중에 사용자가 수동으로 좌우 스크롤할 필요 없게,
+        매 가격 갱신마다 해당 셀로 자동 스크롤한다.
+        세로는 행 가운데, 가로는 토탈가격 열이 보이는 위치로 정렬.
+        """
+        try:
+            price_col = self._find_column("토탈가격")
+            if price_col < 0:
+                return
+            for i, r in enumerate(self.model.all_rows()):
+                if getattr(r, "row", None) == excel_row:
+                    idx = self.model.index(i, price_col)
+                    # PositionAtCenter — 세로/가로 모두 화면 중앙으로 끌어옴.
+                    # 토탈가격 열이 항상 시야에 들어오게 됨.
+                    self.table.scrollTo(idx, self.table.PositionAtCenter)
+                    break
+        except Exception as exc:
+            log.debug(f"가격 셀 스크롤 실패 (행 {excel_row}): {exc}")
 
     def _notify_user_attention(self, order: Order, msg: str) -> None:
         """카드 인증 등 사용자 직접 처리가 필요할 때 주의 환기.

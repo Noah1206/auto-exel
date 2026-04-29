@@ -3735,58 +3735,112 @@ class OrderAutomation:
                 "카드 인증을 못 하셨거나 결제가 취소되었습니다."
             ) from exc
 
-        # 1) 주문번호 추출 — 셀렉터 → 실패시 JS 페이지 텍스트 정규식 fallback
-        # 주문번호는 8자리 이상 숫자/하이픈만 인정. "주문상세보기" 같은 텍스트는 절대 저장 X
+        # 1) 주문번호 추출
+        #    11번가 완료 페이지의 "주문번호" 는 URL 쿼리스트링 ordNo=... 에 가장
+        #    신뢰성 있게 들어있다 (예: getOrderDone&ordNo=20260429062671039).
+        #    페이지 본문 휴리스틱은 전화번호(010-XXXX-XXXX) 같은 11자리 패턴을
+        #    오인식하는 사고가 있어 URL 추출을 1순위로 둔다.
+        #
+        # 우선순위:
+        #   a) URL 쿼리 ordNo (정답)
+        #   b) selector confirmation.order_number — 단, 본문 매칭 시 전화번호 제외
+        #   c) JS fallback — '주문번호' 라벨 근처 / 본문에서 가장 긴 순수 숫자
+        #      (전화번호 형식은 명시적으로 거부)
         import re as _re
-        ORDER_NO_RE = _re.compile(r"[\d\-]{8,}")
+        # 순수 숫자 8자리 이상 (전화번호 010- 시작 패턴은 별도 거부 로직으로 차단)
+        ORDER_NO_RE = _re.compile(r"\d{8,}")
+        # 한국 휴대폰: 010/011/016/017/018/019 로 시작하는 하이픈 포함 패턴
+        PHONE_RE = _re.compile(r"\b01[0-9]-?\d{3,4}-?\d{4}\b")
         order_no: str | None = None
-        try:
-            text = await self.selectors.get_text(
-                page, "confirmation.order_number", timeout_ms=5000
-            )
-            match = ORDER_NO_RE.search(text or "")
-            if match:
-                order_no = match.group(0)
-            else:
-                log.warning(
-                    f"주문번호 셀렉터가 잡았으나 숫자 패턴 없음: text={text!r} "
-                    "→ JS fallback 으로 재시도"
-                )
-        except ElementNotFoundError:
-            log.warning(
-                "주문번호 셀렉터 매칭 실패 → 페이지 텍스트에서 패턴 검색"
-            )
 
+        def _accept(candidate: str | None) -> str | None:
+            """후보 문자열에서 주문번호로 인정 가능한 부분만 추출.
+            전화번호(010-XXXX-XXXX) 가 끼어 있으면 그건 제거하고 다시 매칭.
+            """
+            if not candidate:
+                return None
+            cleaned = PHONE_RE.sub("", candidate)
+            m = ORDER_NO_RE.search(cleaned)
+            if not m:
+                return None
+            num = m.group(0)
+            # 너무 짧거나(8자리 미만) 명백한 전화번호 끝자리(8자리 이하) 거부
+            if len(num) < 8:
+                return None
+            return num
+
+        # a) URL ordNo — 가장 신뢰도 높음
+        try:
+            current_url = page.url or ""
+            url_match = _re.search(r"[?&]ordNo=([0-9\-]+)", current_url)
+            if url_match:
+                candidate = _accept(url_match.group(1))
+                if candidate:
+                    order_no = candidate
+                    log.info(f"주문번호 URL ordNo 에서 추출: {order_no}")
+        except Exception as exc:
+            log.debug(f"URL ordNo 추출 실패: {exc}")
+
+        # b) selector
         if not order_no:
-            # JS fallback: 페이지 텍스트에서 '주문번호' 라벨 근처 또는 8자리 이상
-            # 숫자/하이픈 패턴 추출. 11번가 주문번호는 보통 10~14자리 숫자.
             try:
-                order_no = await page.evaluate(
+                text = await self.selectors.get_text(
+                    page, "confirmation.order_number", timeout_ms=5000
+                )
+                candidate = _accept(text)
+                if candidate:
+                    order_no = candidate
+                else:
+                    log.warning(
+                        f"주문번호 셀렉터가 잡았으나 숫자 패턴 없음: text={text!r} "
+                        "→ JS fallback 으로 재시도"
+                    )
+            except ElementNotFoundError:
+                log.warning(
+                    "주문번호 셀렉터 매칭 실패 → 페이지 텍스트에서 패턴 검색"
+                )
+
+        # c) JS fallback — 전화번호는 명시적으로 거부
+        if not order_no:
+            try:
+                js_result = await page.evaluate(
                     r"""() => {
                       const body = document.body ? (document.body.innerText || '') : '';
-                      // 1) "주문번호" 라벨 뒤에 오는 숫자/하이픈
-                      let m = body.match(/주문\s*번호[^\d]{0,20}([0-9][0-9\-]{7,})/);
+                      // 한국 휴대폰 형식 (010-1234-5678 등) 은 매칭에서 제외
+                      const stripped = body.replace(/\b01[0-9]-?\d{3,4}-?\d{4}\b/g, ' ');
+                      // 1) "주문번호" 라벨 뒤에 오는 8자리 이상 순수 숫자
+                      let m = stripped.match(/주문\s*번호[^\d]{0,20}(\d{8,})/);
                       if (m) return m[1];
-                      // 2) 페이지 내 가장 긴 숫자 시퀀스 (8자리 이상)
-                      const all = body.match(/[0-9][0-9\-]{7,}/g) || [];
+                      // 2) 본문에서 가장 긴 순수 숫자 시퀀스 (10자리 이상 우선)
+                      const all = stripped.match(/\d{10,}/g) || [];
                       if (all.length === 0) return null;
                       all.sort((a, b) => b.length - a.length);
                       return all[0];
                     }"""
                 )
+                candidate = _accept(js_result)
+                if candidate:
+                    order_no = candidate
             except Exception as exc:
                 log.warning(f"JS 주문번호 추출 실패: {exc}")
 
-        # 최종 안전장치: 어떤 경로로 들어왔든 숫자 패턴 매칭이 안 되면 거부.
+        # 최종 안전장치
         if order_no:
-            final_match = ORDER_NO_RE.search(order_no)
-            if not final_match:
+            # 휴대폰 패턴이면 거부 (이중 안전장치)
+            if PHONE_RE.fullmatch(order_no.replace(" ", "")):
                 log.warning(
-                    f"주문번호 검증 실패 ('숫자/하이픈 8자리+' 아님): {order_no!r} → 거부"
+                    f"주문번호로 전화번호가 잡혀 거부: {order_no!r}"
                 )
                 order_no = None
             else:
-                order_no = final_match.group(0)
+                final_match = ORDER_NO_RE.search(order_no)
+                if not final_match:
+                    log.warning(
+                        f"주문번호 검증 실패 ('숫자 8자리+' 아님): {order_no!r} → 거부"
+                    )
+                    order_no = None
+                else:
+                    order_no = final_match.group(0)
 
         if not order_no:
             raise ElementNotFoundError(
