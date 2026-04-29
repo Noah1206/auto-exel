@@ -1500,6 +1500,7 @@ class OrderAutomation:
                 base_addr=order.address_base(),
                 claimed_popup=claimed_popup,
                 prefer_jibun=False,  # 항상 도로명 결과 선택
+                is_jibun=is_jibun,   # 지번이면 우편번호 검색 우선
             )
             if ok:
                 log.info(
@@ -1755,6 +1756,7 @@ class OrderAutomation:
     async def _auto_search_and_pick_address(
         self, page: Page, query: str, postal: str = "", base_addr: str = "",
         claimed_popup: Page | None = None, prefer_jibun: bool = False,
+        is_jibun: bool = False,
     ) -> bool:
         """팝업에서 query 로 자동 검색 + 결과 자동 선택.
 
@@ -2368,15 +2370,28 @@ class OrderAutomation:
                 await asyncio.sleep(0.05)
 
         # 검색어 후보 시퀀스 — 결과 0건일 때 차례로 시도
-        # 1순위: query (시/도 뺀 base 주소)
-        # 2순위: 우편번호
-        # 3순위: 동까지만 잘라낸 base
-        # 4순위: 시/구만 남긴 base — 마지막 fallback
+        # 지번 주소인 경우:
+        #   1순위: 우편번호 (가장 정확한 결과)
+        #   2순위: query (시/도 뺀 base 주소)
+        #   3순위: 동까지만 잘라낸 base
+        #   4순위: 시/구만 남긴 base — 마지막 fallback
+        # 도로명 주소인 경우:
+        #   1순위: query (시/도 뺀 base 주소)
+        #   2순위: 우편번호
+        #   (이하 동일)
         query_candidates: list[str] = []
-        if query:
-            query_candidates.append(query)
-        if postal and postal not in query_candidates:
-            query_candidates.append(postal)
+        if is_jibun:
+            # 지번 주소: 우편번호 검색이 훨씬 정확 (지번 쿼리는 결과가 너무 많거나 매칭 어려움)
+            if postal:
+                query_candidates.append(postal)
+            if query and query not in query_candidates:
+                query_candidates.append(query)
+        else:
+            # 도로명 주소: 기존 순서 유지
+            if query:
+                query_candidates.append(query)
+            if postal and postal not in query_candidates:
+                query_candidates.append(postal)
 
         import re as _re
 
@@ -2436,7 +2451,7 @@ class OrderAutomation:
                 if s and s not in query_candidates:
                     query_candidates.append(s)
 
-        log.info(f"주소찾기 검색어 후보: {query_candidates}")
+        log.info(f"주소찾기 검색어 후보: {query_candidates} (is_jibun={is_jibun})")
 
         async def _attempt(target, q: str) -> bool:
             return await try_in_context(target, query_override=q)
