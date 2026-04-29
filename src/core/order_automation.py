@@ -2204,16 +2204,32 @@ class OrderAutomation:
     // ★ 핵심 보너스: 같은 묶음/형제에 base 의 지번 번지(예: '1887-4') 가
     //   그대로 표기되면 거의 정답.
     if (baseJibunNum && probeTxt.includes(baseJibunNum)) bonus += 20;
-    if (score + bonus < Math.ceil(tokens.length * 0.7)) return null;
-    return { el: el, anchor: a, score: score + bonus, total: tokens.length, bonus: bonus, cls: cls };
+    // 우편번호가 일치하면 임계값을 30%로 낮춤 (우편번호가 이미 주소를 특정)
+    // 우편번호 불일치 시에도 동 이름이 매칭되면 50%로 완화 (지번 번호는 도로명 결과에 없음)
+    let threshold = 0.7;
+    if (postalMatched) {
+      threshold = 0.3;
+    } else if (baseDong && probeTxt.includes(baseDong)) {
+      // 동 이름이 정확히 매칭되면 threshold를 50%로 낮춤
+      // (지번 번호 "823-13" 같은 토큰은 도로명 결과에 없을 수 있음)
+      threshold = 0.5;
+    }
+    if (score + bonus < Math.ceil(tokens.length * threshold)) return null;
+    return { el: el, anchor: a, score: score + bonus, total: tokens.length, bonus: bonus, cls: cls, postalMatched: postalMatched };
   }
+
+  // 디버깅: 평가 과정 진단 정보 수집
+  let _evalDiag = { postalChecked: 0, postalMatched: 0, evalTotal: 0, evalPassed: 0,
+                   firstReject: null, baseDong: '', baseJibunNum: '', baseHasRoad: baseHasRoad };
 
   // 1) 우편번호 매칭 컨테이너 안에서 후보 평가. 그 다음 전체에서.
   let candidates = [];
   if (postal) {
     for (const el of containers) {
       const t = fullText(el).replace(/\s+/g, ' ');
+      _evalDiag.postalChecked++;
       if (!t.includes(postal)) continue;
+      _evalDiag.postalMatched++;
       // 우편번호가 일치하면 postalMatched=true → 동 이름 매칭 완화
       const ev = _evaluateAnchor(el, true);
       if (ev) candidates.push(ev);
@@ -2221,9 +2237,25 @@ class OrderAutomation:
   }
   if (candidates.length === 0) {
     for (const el of containers) {
+      _evalDiag.evalTotal++;
       // 우편번호 불일치 → postalMatched=false → 동 이름 필수 매칭
       const ev = _evaluateAnchor(el, false);
-      if (ev) candidates.push(ev);
+      if (ev) {
+        candidates.push(ev);
+        _evalDiag.evalPassed++;
+      } else if (!_evalDiag.firstReject) {
+        // 첫 번째 거부 이유 기록
+        const a = (el.matches && el.matches('a, button')) ? el
+                : (el.querySelector && el.querySelector('a[onclick], button[onclick]'));
+        const cls = a ? _classify(a) : '?';
+        const aTxt = a ? (a.innerText || '').replace(/\s+/g, ' ').slice(0, 60) : '';
+        const dongMatch = baseAddrNorm.match(/[가-힣]+(?:동|리|면|읍|가)/);
+        const baseDong = dongMatch ? dongMatch[0] : '';
+        _evalDiag.baseDong = baseDong;
+        const jibunNumMatch = baseAddrNorm.match(/(?:동|리|면|읍|가)\s*(\d+(?:-\d+)?)/);
+        _evalDiag.baseJibunNum = jibunNumMatch ? jibunNumMatch[1] : '';
+        _evalDiag.firstReject = cls + ':' + aTxt + '|dong=' + baseDong + ',hasDong=' + aTxt.includes(baseDong);
+      }
     }
   }
 
@@ -2265,6 +2297,10 @@ class OrderAutomation:
   // 결과 0건이거나 모두 클릭 실패 → 진단 정보 반환 (onclick 패턴 + 분류 통계 포함)
   return 'no-pick(count=' + _diag.count
        + ', R=' + _diag.R + ', J=' + _diag.J + ', U=' + _diag.U
+       + ', postChk=' + _evalDiag.postalChecked + ', postMatch=' + _evalDiag.postalMatched
+       + ', evalT=' + _evalDiag.evalTotal + ', evalP=' + _evalDiag.evalPassed
+       + ', baseRoad=' + _evalDiag.baseHasRoad
+       + ', reject=' + (_evalDiag.firstReject || 'none')
        + ', first=' + (_diag.first || '?')
        + ', oc=' + (_diag.firstOnclick || '?') + ')';
 }
@@ -2329,6 +2365,9 @@ class OrderAutomation:
                     except Exception as exc:
                         log.debug(f"pick_js 실패 (attempt {attempt}): {exc}")
                         continue
+                    # 디버깅: 결과가 있을 때 로그 (no-pick 진단 포함)
+                    if r2 and 'count=' in r2 and 'count=0' not in r2:
+                        log.info(f"pick_js 시도 {attempt}: {r2}")
                     if r2 and not r2.startswith('no-pick'):
                         log.info(f"주소찾기 결과 선택 성공: {r2}")
                         return True
