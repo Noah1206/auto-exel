@@ -2172,23 +2172,28 @@ class OrderAutomation:
     const dongMatch = baseAddrNorm.match(/[가-힣]+(?:동|리|면|읍|가)/);
     const baseDong = dongMatch ? dongMatch[0] : '';
 
-    // 결과 묶음 텍스트 — 다음 3계층 모두 합쳐 검사.
+    // 결과 묶음 텍스트 — 다음 계층 모두 합쳐 검사.
     //  1) anchor 자기 텍스트
-    //  2) 가장 가까운 tr/li 조상 텍스트 (한 행 묶음)
-    //  3) DOM 인접 형제(직전/직후) anchor 의 텍스트 (도로명/지번 a 가 별도일 때)
+    //  2) 가장 가까운 tr/li 조상 텍스트 (한 행 묶음 — 도로명+지번 모두 포함)
+    //  3) 행 안의 모든 fn_setAddr anchor 텍스트 (별도 td에 있는 지번 anchor 포함)
     const groupTxt = fullText(el).replace(/\s+/g, ' ');
     let probeTxt = aTxt + ' ' + groupTxt;
     try {
-      // 같은 부모 안에서 인접한 fn_setAddr anchor 의 텍스트도 함께 (지번 a 가 별도일 때)
-      const parent = a.parentElement;
-      if (parent) {
-        const sibs = Array.from(parent.querySelectorAll(
+      // 같은 tr/li 행 안의 모든 fn_setAddr anchor 텍스트를 합침
+      // (도로명 anchor 와 지번 anchor 가 별도 td 에 있을 수 있음)
+      let row = a;
+      for (let i = 0; row && i < 6; i++) {
+        if (row.tagName === 'TR' || row.tagName === 'LI') break;
+        row = row.parentElement;
+      }
+      if (row && (row.tagName === 'TR' || row.tagName === 'LI')) {
+        const rowAnchors = Array.from(row.querySelectorAll(
           'a[onclick*="fn_setAddr"], a[onclick*="setAddr"]'
         ));
-        const idx = sibs.indexOf(a);
-        if (idx >= 0) {
-          if (idx - 1 >= 0) probeTxt += ' ' + (sibs[idx - 1].innerText || '');
-          if (idx + 1 < sibs.length) probeTxt += ' ' + (sibs[idx + 1].innerText || '');
+        for (const ra of rowAnchors) {
+          if (ra !== a) {
+            probeTxt += ' ' + (ra.innerText || '');
+          }
         }
       }
     } catch(e) {}
