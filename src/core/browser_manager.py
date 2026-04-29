@@ -121,15 +121,15 @@ class BrowserManager:
         except Exception as exc:
             log.debug(f"context close 핸들러 등록 실패 (무시): {exc}")
 
-        # JS confirm()/alert() 다이얼로그 자동 수락 — 11번가 개인통관부호 삭제 등에서
-        # confirm 다이얼로그가 사용되는데 Playwright 기본은 모두 dismiss 라 사용자가
-        # '확인' 을 누를 수 없게 된다. 모든 페이지에 dialog 핸들러를 자동 등록.
+        # JS confirm()/alert()/prompt() 다이얼로그를 일반 Chrome 처럼 사용자에게
+        # 보여줘야 한다 (예: 11번가 개인통관부호 삭제 confirm).
+        # 모든 페이지에 빈 dialog 리스너를 부착해 Playwright 의 자동 dismiss 를 막는다.
         try:
-            self._context.on("page", self._attach_dialog_handler)
+            self._context.on("page", self._disable_auto_dialog)
             for page in self._context.pages:
-                self._attach_dialog_handler(page)
+                self._disable_auto_dialog(page)
         except Exception as exc:
-            log.debug(f"dialog 핸들러 등록 실패 (무시): {exc}")
+            log.debug(f"dialog 자동 dismiss 차단 등록 실패 (무시): {exc}")
 
         # stealth 초기화 (선택)
         if self.stealth_enabled:
@@ -536,31 +536,35 @@ class BrowserManager:
                 pass
 
     @staticmethod
-    def _attach_dialog_handler(page: Page) -> None:
-        """페이지의 JS confirm/alert/prompt 를 자동 accept 한다.
+    def _disable_auto_dialog(page: Page) -> None:
+        """JS 다이얼로그를 일반 Chrome 처럼 화면에 표시되게 한다.
 
-        Playwright 기본 동작은 다이얼로그를 자동 dismiss 라 '삭제하시겠습니까?'
-        같은 confirm 에서 사용자가 '확인' 을 누를 수 없는 상태가 된다.
-        실서비스에서 이 다이얼로그는 거의 항상 사용자가 '확인' 을 누르길
-        기대하므로 자동 accept 로 처리.
+        Playwright 기본 동작 (_browser_context.py:_on_dialog):
+          - dialog 이벤트 listener 가 없으면 자동 dismiss
+          - listener 가 있으면 listener 안에서 accept/dismiss 를 호출해야 함
 
-        prompt 의 경우 입력값이 필요하지만 11번가 페이지에서는 거의 사용되지
-        않으므로 빈 문자열로 accept.
+        우리는 사용자에게 '삭제하시겠습니까?' 같은 confirm 을 직접 보여주고
+        싶으므로, 비어있는 listener 만 등록한다. listener 가 존재하므로
+        Playwright 의 자동 dismiss 가 동작하지 않고, 핸들러 안에서 아무것도
+        안 부르면 Chrome 이 다이얼로그를 화면에 표시한 채로 유지한다.
+        사용자가 직접 다이얼로그의 '확인' / '취소' 를 누르면 페이지가 진행된다.
+
+        주의: 이 핸들러는 Chrome 의 자동화 비활성화 (launch 시
+        ignore_default_args=['--enable-automation']) 와 결합돼야 정상 동작.
         """
-        def _on_dialog(dialog) -> None:
+        def _noop(_dialog) -> None:
             try:
-                dtype = getattr(dialog, "type", "")
-                msg = getattr(dialog, "message", "")
-                log.info(f"JS dialog 자동 수락: type={dtype} msg={msg!r}")
-                # accept() 는 coroutine — 동기 핸들러 안에서 await 못 하므로
-                # 내부적으로 task 로 던진다.
-                import asyncio as _aio
-                _aio.create_task(dialog.accept())
-            except Exception as exc:
-                log.debug(f"dialog 처리 실패: {exc}")
+                dtype = getattr(_dialog, "type", "")
+                msg = getattr(_dialog, "message", "")
+                log.info(
+                    f"JS dialog 표시 (사용자 결정 대기): type={dtype} msg={msg!r}"
+                )
+            except Exception:
+                pass
+            # accept/dismiss 호출 안 함 — 사용자가 직접 클릭하게 둠.
 
         try:
-            page.on("dialog", _on_dialog)
+            page.on("dialog", _noop)
         except Exception as exc:
             log.debug(f"dialog 핸들러 부착 실패: {exc}")
 
