@@ -41,7 +41,6 @@ class OrderState(str, Enum):
     PENDING = "pending"     # 대기 (실행 안 됨 / 사용자 취소 후 복귀)
     OPEN_PRODUCT = "open_product"
     CHECK_LOGIN = "check_login"
-    SELECT_QUANTITY = "select_quantity"
     CLICK_BUY = "click_buy"
     FILL_FORM = "fill_form"
     WAIT_PAYMENT = "wait_payment"
@@ -96,7 +95,7 @@ class OrderAutomation:
         # (사용자가 결제 완료 후 행 메뉴에서 "다음으로" 를 누르면 set() 된다)
         self._next_events: dict[int, asyncio.Event] = {}
         # order.row → "기입" 사용자 트리거 이벤트
-        # (수량 변경 후 사용자가 직접 '구매하기' 를 누르고 '기입' 버튼을 누를 때까지 대기)
+        # (주문서 페이지 진입 후 사용자가 '기입' 을 눌러야 자동 입력 시작)
         self._fill_events: dict[int, asyncio.Event] = {}
         # order.row → "영문기입" 사용자 트리거 이벤트
         # (받는사람/주소 입력 후 사용자가 '영문기입' 을 눌러야 통관/영문/나머지 입력)
@@ -210,15 +209,115 @@ class OrderAutomation:
         # 못 찾으면 current_page 그대로 (호출자가 적절히 처리)
         return current_page
 
+    async def _await_order_page(
+        self, row: int, page: Page | None = None, timeout_sec: int = 1800
+    ) -> None:
+        """주문서 페이지 진입까지 대기.
+
+        다음 중 먼저 일어나는 쪽까지 대기:
+          1) page 자체 또는 opener=page 인 새 탭이 주문서 URL 로 navigate
+             → 정상 return (호출자가 _switch_to_order_page 로 핸들 갱신)
+          2) 이 행이 점유한 페이지가 닫힘 → UserInterventionRequired
+
+        병렬 진행 안전: 다른 행이 점유한 탭은 후보에서 제외.
+        """
+        if page is None:
+            return
+
+        async def _wait_order_url() -> str:
+            poll = 0.4
+            while True:
+                try:
+                    if page.is_closed():
+                        return "closed"
+                    # 1) 현재 page 가 주문서로 navigate 됐는가
+                    url = (page.url or "").lower()
+                    if (
+                        "/pay/" in url or "orderinfoaction" in url
+                        or "orderinfo" in url
+                    ):
+                        return "order"
+                    # 2) opener=page 인 새 탭이 주문서로 열렸는가
+                    owned_pages = {
+                        p for r, p in self._pages.items()
+                        if p is not None and p is not page
+                    }
+                    try:
+                        ctx = page.context
+                        candidates = list(ctx.pages)
+                    except Exception:
+                        candidates = []
+                    for p in candidates:
+                        try:
+                            if p is page or p.is_closed() or p in owned_pages:
+                                continue
+                            try:
+                                opener = await p.opener()
+                            except Exception:
+                                opener = None
+                            if opener is not page:
+                                continue
+                            purl = (p.url or "").lower()
+                            if (
+                                "/pay/" in purl or "orderinfoaction" in purl
+                                or "orderinfo" in purl
+                            ):
+                                return "order"
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                await asyncio.sleep(poll)
+
+        async def _wait_pages_closed() -> str:
+            poll = 0.5
+            while True:
+                try:
+                    owned = self._pages.get(row)
+                    if owned is None or owned.is_closed():
+                        log.info(f"행{row}: 점유 페이지 닫힘 감지 → 행 종료")
+                        return "closed"
+                    if page.is_closed():
+                        log.info(f"행{row}: 대기 페이지 닫힘 감지 → 행 종료")
+                        return "closed"
+                except Exception:
+                    pass
+                await asyncio.sleep(poll)
+
+        tasks = {
+            asyncio.create_task(_wait_order_url()),
+            asyncio.create_task(_wait_pages_closed()),
+        }
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=timeout_sec,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        if not done:
+            raise asyncio.TimeoutError("주문서 진입 대기 타임아웃")
+        for t in done:
+            try:
+                result = t.result()
+            except Exception:
+                continue
+            if result == "closed":
+                raise UserInterventionRequired(
+                    "사용자가 페이지를 닫아 행을 종료했습니다.",
+                    checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                    reset_to_pending=True,
+                )
+
     async def _await_user_fill(
         self, row: int, page: Page | None = None, timeout_sec: int = 1800
     ) -> None:
         """다음 트리거 중 먼저 일어나는 쪽까지 대기:
           1) '기입' 버튼 클릭 → signal_fill(row)
-          2) 페이지(또는 모든 컨텍스트 페이지) 닫힘 → UserInterventionRequired 예외
+          2) 점유 페이지 닫힘 → UserInterventionRequired
 
-        반환: 1 일 때 정상 return.
-        예외: 2 일 때 UserInterventionRequired (호출자가 행 종료 처리).
+        호출 위치: 주문서 페이지 진입 직후. 사용자가 페이지를 검토하고
+        '기입' 버튼을 누르면 자동 입력이 시작된다.
         """
         ev = asyncio.Event()
         self._fill_events[row] = ev
@@ -228,31 +327,18 @@ class OrderAutomation:
             return "user"
 
         async def _wait_pages_closed() -> str:
-            """이 행이 점유한 페이지가 닫힐 때까지 폴링. 닫히면 'closed' 반환.
-
-            병렬 진행 보호: ctx.pages 전체가 아니라 '이 행 소유의 page' 만 검사.
-            (다른 행이 새 탭을 열어둔 상태에서도 이 행의 페이지 닫힘이 정확히 감지돼야
-             _busy_rows 가 정상적으로 해제됨.)
-            """
             if page is None:
                 await asyncio.Event().wait()
                 return "closed"
             poll = 0.5
             while True:
                 try:
-                    # 이 행이 더 이상 _pages 에 등록돼 있지 않거나(다른 경로로 정리됨)
-                    # 등록된 페이지가 닫혔으면 종료로 간주.
                     owned = self._pages.get(row)
                     if owned is None or owned.is_closed():
-                        log.info(
-                            f"행{row}: 점유 페이지 닫힘 감지 → 행 종료"
-                        )
+                        log.info(f"행{row}: 점유 페이지 닫힘 감지 → 행 종료")
                         return "closed"
-                    # 인자로 받은 page 자체가 닫혀도 종료 (방어)
                     if page.is_closed():
-                        log.info(
-                            f"행{row}: 대기 페이지 닫힘 감지 → 행 종료"
-                        )
+                        log.info(f"행{row}: 대기 페이지 닫힘 감지 → 행 종료")
                         return "closed"
                 except Exception:
                     pass
@@ -272,7 +358,6 @@ class OrderAutomation:
                 t.cancel()
             if not done:
                 raise asyncio.TimeoutError("기입 대기 타임아웃")
-            # 어떤 trigger 였는지 확인
             for t in done:
                 try:
                     result = t.result()
@@ -281,7 +366,7 @@ class OrderAutomation:
                 if result == "closed":
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
-                        checkpoint=Checkpoint.AT_PRODUCT_PAGE.value,
+                        checkpoint=Checkpoint.AT_ORDER_PAGE.value,
                         reset_to_pending=True,
                     )
         finally:
@@ -489,25 +574,11 @@ class OrderAutomation:
                 await self._ensure_logged_in(page)
                 await self._detect_abnormal(page)
 
-                # 사용자가 옵션을 선택할 때까지 대기 → 옵션이 사이드바에 추가되면
-                # 그 옵션의 수량을 엑셀의 수량으로 자동 조정
-                self._emit(
-                    order,
-                    OrderState.SELECT_QUANTITY,
-                    f"옵션 선택 대기 중... 옵션을 고르면 수량 {order.quantity} 로 자동 조정",
-                )
-                ok = await self._wait_option_then_set_quantity(page, order)
-                if not ok or page.is_closed():
-                    raise UserInterventionRequired(
-                        "사용자가 페이지를 닫아 행을 종료했습니다.",
-                        checkpoint=Checkpoint.START.value,
-                        reset_to_pending=True,
-                    )
-
                 self._checkpoints[order.row] = Checkpoint.AT_PRODUCT_PAGE
                 cp = Checkpoint.AT_PRODUCT_PAGE
 
-            # 2) 사용자가 직접 '구매하기' 누르고 '기입' 버튼 클릭 대기
+            # 2) 사용자가 옵션·수량 직접 설정 후 '구매하기' 클릭 대기
+            #    구매하기 → 주문서 페이지 진입이 감지되면 곧바로 자동 기입.
             if cp == Checkpoint.AT_PRODUCT_PAGE:
                 if page.is_closed():
                     raise UserInterventionRequired(
@@ -518,49 +589,10 @@ class OrderAutomation:
                 self._emit(
                     order,
                     OrderState.CLICK_BUY,
-                    "Chrome 에서 '구매하기' 를 누르면 자동으로 주문서 입력이 시작됩니다",
+                    "Chrome 에서 옵션·수량 설정 후 '구매하기' 를 누르면 자동으로 주문서 입력이 시작됩니다",
                 )
 
-                # 캐시백 활성화 → 리다이렉트로 상품 페이지 재진입 시 수량 리셋 방어.
-                # framenavigated 이벤트로 product URL 재진입 감지 → 수량 자동 재설정.
-                product_url = order.product_url
-
-                async def _on_nav_relisten():
-                    """현재 page 의 framenavigated 를 감지해 product 재진입 시 수량 재조정."""
-                    try:
-                        cur_url = (page.url or "").lower()
-                        # 11번가 상품 페이지 URL 패턴: /products/<숫자>
-                        if (
-                            "/products/" in cur_url
-                            and not page.is_closed()
-                        ):
-                            log.info(
-                                f"행{order.row}: 상품 페이지 재진입 감지 → 수량 재설정 시도"
-                            )
-                            try:
-                                await self._wait_option_then_set_quantity(
-                                    page, order, timeout_sec=60
-                                )
-                            except Exception as exc:
-                                log.warning(
-                                    f"행{order.row}: 재진입 수량 재설정 실패: {exc}"
-                                )
-                    except Exception:
-                        pass
-
-                def _on_framenavigated(frame):
-                    if frame is page.main_frame:
-                        # async 콜백을 background task 로 띄움
-                        asyncio.create_task(_on_nav_relisten())
-
-                page.on("framenavigated", _on_framenavigated)
-                try:
-                    await self._await_user_fill(order.row, page=page)
-                finally:
-                    try:
-                        page.remove_listener("framenavigated", _on_framenavigated)
-                    except Exception:
-                        pass
+                await self._await_order_page(order.row, page=page)
                 if page.is_closed():
                     raise UserInterventionRequired(
                         "사용자가 페이지를 닫아 행을 종료했습니다.",
@@ -570,11 +602,25 @@ class OrderAutomation:
                 self._checkpoints[order.row] = Checkpoint.AT_ORDER_PAGE
                 cp = Checkpoint.AT_ORDER_PAGE
 
-            # 3) 주문 정보 입력 (사용자가 '기입' 누른 후 실행됨)
+            # 3) 주문서 진입 후 사용자가 '기입' 버튼 누를 때까지 대기 → 자동 입력
             if cp == Checkpoint.AT_ORDER_PAGE:
                 # 주문서 페이지가 떠 있는 활성 탭으로 page 핸들 갱신
                 page = await self._switch_to_order_page(page)
                 self._pages[order.row] = page
+
+                # '기입' 버튼 노출 — 사용자가 페이지를 검토할 시간을 줌
+                self._emit(
+                    order,
+                    OrderState.CLICK_BUY,
+                    "주문서 페이지 — '기입' 버튼을 누르면 주문자 정보 자동 입력",
+                )
+                await self._await_user_fill(order.row, page=page)
+                if page.is_closed():
+                    raise UserInterventionRequired(
+                        "사용자가 페이지를 닫아 행을 종료했습니다.",
+                        checkpoint=Checkpoint.AT_ORDER_PAGE.value,
+                        reset_to_pending=True,
+                    )
 
                 self._emit(order, OrderState.FILL_FORM, "주문자 정보 자동 입력")
                 await self._fill_order_form(page, order)
@@ -712,258 +758,6 @@ class OrderAutomation:
             raise CaptchaDetectedError(
                 "캡차가 감지되었습니다. 브라우저에서 직접 해결 후 재시도하세요."
             )
-
-    async def _wait_option_then_set_quantity(
-        self, page: Page, order: Order, timeout_sec: int = 1800
-    ) -> bool:
-        """사용자가 옵션을 선택해서 사이드바에 추가될 때까지 대기.
-
-        반환:
-          True  — 옵션 감지 후 수량 조정 성공
-          False — 페이지 닫힘 / 타임아웃 → 호출자가 빠르게 종료해야 함
-        """
-        qty = order.quantity
-        if qty <= 0:
-            return True
-
-        # 이벤트 기반: 옵션이 DOM 에 등장하는 순간 즉시 wait_for_function 이
-        # 풀린다. polling 보다 훨씬 빠르게 (수십 ms) 반응한다.
-        # close 감지를 위해 wait_for_function 과 close 이벤트를 race.
-        check_js = """() => {
-            const el = document.querySelector(
-              '.c_product_input input[aria-live="assertive"], '
-              + '.c-card-item__cart input[type="text"], '
-              + 'input[aria-label="주문 수량"], '
-              + 'input[name*="qty" i], input[name*="Qty" i], '
-              + 'input[role="spinbutton"], input[aria-label*="수량"]'
-            );
-            if (!el) return false;
-            const v = (el.value || '').replace(/[^0-9]/g, '');
-            return v.length > 0;
-        }"""
-
-        async def _wait_closed() -> None:
-            while True:
-                if page.is_closed():
-                    return
-                await asyncio.sleep(0.2)
-
-        wait_task = asyncio.create_task(
-            page.wait_for_function(check_js, timeout=timeout_sec * 1000, polling=50)
-        )
-        close_task = asyncio.create_task(_wait_closed())
-
-        done, pending = await asyncio.wait(
-            {wait_task, close_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-
-        if close_task in done:
-            log.info(f"행{order.row}: 페이지 닫힘 → 옵션 대기 종료 (행 종료)")
-            return False
-
-        if page.is_closed():
-            return False
-
-        try:
-            cur = await self._read_current_quantity(page)
-        except Exception:
-            cur = None
-        log.info(
-            f"행{order.row}: 옵션 감지됨 (현재 수량={cur}) → {qty} 로 조정 시도"
-        )
-        await self._select_quantity(page, order)
-        return True
-
-    async def _select_quantity(self, page: Page, order: Order) -> None:
-        """수량을 order.quantity 만큼 맞춘다. 4가지 UI 패턴 지원:
-        1) <select> 드롭다운 — selectOption
-        2) <input> — fill (현재 값 읽고 다르면 덮어쓰기)
-        3) + / - 버튼 — 현재 수량 읽어서 차이만큼 클릭
-        4) JS fallback — 페이지에서 수량 컨테이너를 찾아 직접 조작
-        """
-        qty = order.quantity
-        if qty <= 0:
-            return
-
-        # 1) select 우선
-        try:
-            sel = await self.selectors.find(
-                page, "product_page.quantity_select", timeout_ms=800
-            )
-            await sel.select_option(str(qty))
-            log.info(f"행{order.row}: 수량 select 로 {qty} 선택")
-            return
-        except ElementNotFoundError:
-            pass
-
-        # 2) input 직접 입력
-        try:
-            inp = await self.selectors.find(
-                page, "product_page.quantity_input", timeout_ms=800
-            )
-            # 현재 값 확인
-            try:
-                cur_val = await inp.input_value()
-            except Exception:
-                cur_val = ""
-            await inp.click()
-            try:
-                await inp.fill("")
-            except Exception:
-                pass
-            await inp.fill(str(qty))
-            try:
-                await inp.press("Tab")
-            except Exception:
-                pass
-            # change 이벤트가 안 발화되는 경우 대비 — JS 로 강제 발화
-            try:
-                await inp.evaluate(
-                    "el => { el.dispatchEvent(new Event('input', {bubbles: true}));"
-                    " el.dispatchEvent(new Event('change', {bubbles: true})); }"
-                )
-            except Exception:
-                pass
-            log.info(
-                f"행{order.row}: 수량 input 으로 {qty} 입력 (이전 값={cur_val!r})"
-            )
-            await asyncio.sleep(0.2)
-            return
-        except ElementNotFoundError:
-            pass
-
-        # 3) + / - 버튼 — 현재 수량 읽어서 차이만큼 클릭
-        try:
-            current = await self._read_current_quantity(page)
-        except Exception:
-            current = 1
-        if current is None:
-            current = 1
-        diff = qty - current
-        if diff != 0:
-            try:
-                if diff > 0:
-                    btn = await self.selectors.find(
-                        page,
-                        "product_page.quantity_plus_button",
-                        timeout_ms=800,
-                    )
-                    for _ in range(diff):
-                        await btn.click()
-                        await asyncio.sleep(0.1)
-                else:
-                    btn = await self.selectors.find(
-                        page,
-                        "product_page.quantity_minus_button",
-                        timeout_ms=800,
-                    )
-                    for _ in range(-diff):
-                        await btn.click()
-                        await asyncio.sleep(0.1)
-                log.info(
-                    f"행{order.row}: 수량 +/- 버튼으로 {current} → {qty} 조정"
-                )
-                return
-            except ElementNotFoundError:
-                pass
-
-        # 4) JS fallback — 페이지의 수량 영역을 추론해서 직접 조작
-        if await self._set_quantity_via_js(page, qty):
-            log.info(f"행{order.row}: 수량 JS fallback 으로 {qty} 설정")
-            return
-
-        if qty > 1:
-            log.warning(
-                f"행{order.row}: 수량 선택 UI를 찾지 못함 (수량={qty}). "
-                "사용자가 직접 조정해 주세요"
-            )
-
-    async def _read_current_quantity(self, page: Page) -> int | None:
-        """현재 페이지에 표시된 수량 값을 읽는다."""
-        # 1) input value
-        try:
-            inp = await self.selectors.find(
-                page, "product_page.quantity_input", timeout_ms=400
-            )
-            v = await inp.input_value()
-            if v and v.strip().isdigit():
-                return int(v.strip())
-        except Exception:
-            pass
-        # 2) JS — 11번가 아마존관 신 UI + 일반 수량 컨테이너
-        try:
-            v = await page.evaluate(
-                """() => {
-                    // 11번가 아마존관 신 UI 우선
-                    const newUi = document.querySelector(
-                      '.c_product_input input[aria-live="assertive"], '
-                      + '.c-card-item__cart input[type="text"], '
-                      + 'input[aria-label="주문 수량"]'
-                    );
-                    if (newUi && newUi.value) {
-                      const n = parseInt(newUi.value.replace(/[^\\d]/g, ''), 10);
-                      if (!isNaN(n)) return n;
-                    }
-                    // 일반 input
-                    const inp = document.querySelector(
-                      'input[name*="qty" i], input[name*="Qty" i], '
-                      + 'input[role="spinbutton"], input[aria-label*="수량"]'
-                    );
-                    if (inp && inp.value) {
-                      const n = parseInt(inp.value.replace(/[^\\d]/g, ''), 10);
-                      if (!isNaN(n)) return n;
-                    }
-                    const boxes = document.querySelectorAll(
-                      '[class*="quantity" i], [class*="Quantity" i]'
-                    );
-                    for (const b of boxes) {
-                      const t = (b.innerText || '').trim();
-                      const m = t.match(/^\\s*(\\d+)\\s*$/m);
-                      if (m) return parseInt(m[1], 10);
-                    }
-                    return null;
-                }"""
-            )
-            if isinstance(v, (int, float)):
-                return int(v)
-        except Exception:
-            pass
-        return None
-
-    async def _set_quantity_via_js(self, page: Page, qty: int) -> bool:
-        """JS 로 수량 input/스피너 값을 직접 세팅 + change 이벤트 발화."""
-        try:
-            ok = await page.evaluate(
-                r"""(qty) => {
-                    function setVal(el, v) {
-                      try { el.removeAttribute('readonly'); } catch(e){}
-                      try { el.removeAttribute('disabled'); } catch(e){}
-                      const setter = Object.getOwnPropertyDescriptor(
-                        HTMLInputElement.prototype, 'value'
-                      )?.set;
-                      if (setter) setter.call(el, String(v));
-                      else el.value = String(v);
-                      el.dispatchEvent(new Event('input', {bubbles: true}));
-                      el.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                    const sel = document.querySelector(
-                      'input[name*="qty" i], input[name*="Qty" i], '
-                      + 'input[role="spinbutton"], input[aria-label*="수량"], '
-                      + 'div[class*="quantity" i] input, '
-                      + 'div[class*="Quantity" i] input'
-                    );
-                    if (!sel) return false;
-                    setVal(sel, qty);
-                    return true;
-                }""",
-                qty,
-            )
-            return bool(ok)
-        except Exception as exc:
-            log.debug(f"수량 JS fallback 실패: {exc}")
-            return False
 
     async def _click_buy_now(self, page: Page) -> None:
         # 0) 옵션 있는 상품 대응 — "선택한 옵션 추가하기" 버튼이 있으면 먼저 클릭.
@@ -2103,14 +1897,19 @@ class OrderAutomation:
     if (m2) return m2[0];
     return '';
   }
-  // baseAddr 에서 번지수 추출 — '도로명 N' 의 N. 다른 번지수 같은 도로명 사고 방지.
-  function _extractRoadNumber(b) {
-    if (!b) return '';
-    const m = b.match(/(?:대로|로|길)\s*(\d+(?:-\d+)?)/);
+  // baseAddr 에서 번지수 추출 — 도로명 토큰 '바로 뒤'의 번지.
+  // 도로명에 숫자가 들어간 경우(예: '사평대로26길', '선릉로130길')
+  // 단순히 /(?:대로|로|길)\s*(\d+)/ 로는 도로명 안 숫자(26)가 잡혀서 안 됨.
+  // → 토큰 전체를 먼저 매칭하고 그 다음 번지를 가져옴.
+  function _extractRoadNumber(b, token) {
+    if (!b || !token) return '';
+    const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(esc + '\\s*(\\d+(?:-\\d+)?)');
+    const m = b.match(re);
     return m ? m[1] : '';
   }
   const baseRoadToken = _extractRoadToken(baseAddrNorm);
-  const baseRoadNumber = _extractRoadNumber(baseAddrNorm);
+  const baseRoadNumber = _extractRoadNumber(baseAddrNorm, baseRoadToken);
   const baseHasRoad = !!baseRoadToken;
 
   // 매칭 정책 — "원래 주소와 다른 주소" 가 자동 선택되는 사고 차단:
@@ -2134,9 +1933,18 @@ class OrderAutomation:
       if (!aTxt.includes(baseRoadToken)) return null;  // 다른 도로명 결과 → 거부
       let bonus = 0;
       if (baseRoadNumber) {
-        const numRe = new RegExp(baseRoadToken
-          .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*' + baseRoadNumber + '\\b');
-        if (numRe.test(aTxt)) bonus = 10;
+        const escTok = baseRoadToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const numRe = new RegExp(escTok + '\\s*' + baseRoadNumber + '\\b');
+        if (numRe.test(aTxt)) {
+          bonus = 10;
+        } else {
+          // 같은 도로명 뒤에 다른 번지수가 적힌 anchor 는 거부.
+          //   예) base='사평대로26길 103' vs anchor='사평대로26길 26-4'
+          //   → 같은 도로의 다른 번지를 우연히 클릭하는 사고 차단.
+          const anyNumRe = new RegExp(escTok + '\\s*(\\d+(?:-\\d+)?)');
+          const m = aTxt.match(anyNumRe);
+          if (m && m[1] && m[1] !== baseRoadNumber) return null;
+        }
       }
       const tokens = baseAddrNorm.split(/\s+/).filter(t => t.length >= 1);
       let score = 0;

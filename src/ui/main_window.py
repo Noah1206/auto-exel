@@ -437,7 +437,7 @@ class MainWindow(QMainWindow):
         self.action_scrape = QAction("가격 조회", self)
         self.action_scrape.triggered.connect(self._on_scrape_prices)
 
-        # 기입 — 선택한 행에 대해 '기입' 신호 전송 (사용자가 원할 때 강제 트리거)
+        # 기입 — 주문서 페이지 진입 후 사용자가 원할 때 자동 입력 시작
         self.action_fill = QAction("기입", self)
         self.action_fill.setToolTip(
             "선택한 행이 '기입 대기' 중이면 받는사람·주소·전화 자동 입력 시작"
@@ -489,7 +489,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.action_login_11st)     # 11번가 로그인 (수동 트리거)
         tb.addAction(self.action_save_original)  # 원본에 저장
         tb.addAction(self.action_scrape)         # 가격 조회
-        tb.addAction(self.action_fill)           # 기입 (모든 필드 한 번에)
+        tb.addAction(self.action_fill)           # 기입 (주문서 진입 후 1회 클릭)
 
         # 초기: 엑셀 미로드 상태이므로 툴바 숨김
         tb.setVisible(False)
@@ -1051,13 +1051,11 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # 1) 선택된 행 중 기입 대기 중인 것 찾기
         selected = self._selected_orders()
         targets = [
             o for o in selected
             if self.automation.is_awaiting_fill(o.row)
         ]
-        # 2) 선택 없거나 기입 대기 행이 없으면 전체에서 자동 탐색
         if not targets:
             for r in self.model.all_rows():
                 if isinstance(r, Order) and self.automation.is_awaiting_fill(r.row):
@@ -1065,7 +1063,7 @@ class MainWindow(QMainWindow):
 
         if not targets:
             self.statusBar().showMessage(
-                "기입 대기 중인 행이 없습니다 (수량 변경 후 자동으로 대기 상태가 됩니다)",
+                "기입 대기 중인 행이 없습니다 (구매하기 → 주문서 진입 시 대기 상태가 됩니다)",
                 4000,
             )
             return
