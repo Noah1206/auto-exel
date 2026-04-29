@@ -2419,8 +2419,8 @@ class OrderAutomation:
 
         # 검색어 후보 시퀀스 — 결과 0건일 때 차례로 시도
         # 지번 주소인 경우:
-        #   1순위: 우편번호 (가장 정확한 결과)
-        #   2순위: query (시/도 뺀 base 주소)
+        #   1순위: query (지번 주소 — "평택시 서정동 823-13" 처럼 정확한 검색)
+        #   2순위: 우편번호 (fallback — 지번 검색 결과가 없을 때)
         #   3순위: 동까지만 잘라낸 base
         #   4순위: 시/구만 남긴 base — 마지막 fallback
         # 도로명 주소인 경우:
@@ -2429,11 +2429,12 @@ class OrderAutomation:
         #   (이하 동일)
         query_candidates: list[str] = []
         if is_jibun:
-            # 지번 주소: 우편번호 검색이 훨씬 정확 (지번 쿼리는 결과가 너무 많거나 매칭 어려움)
-            if postal:
-                query_candidates.append(postal)
-            if query and query not in query_candidates:
+            # 지번 주소: 지번 쿼리 먼저 (정확한 결과), 우편번호는 fallback
+            # 우편번호로 검색하면 같은 우편번호 공유하는 모든 주소가 나와서 부정확
+            if query:
                 query_candidates.append(query)
+            if postal and postal not in query_candidates:
+                query_candidates.append(postal)
         else:
             # 도로명 주소: 기존 순서 유지
             if query:
