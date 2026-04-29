@@ -52,9 +52,9 @@ class AutomationConfig(BaseModel):
 
 
 class PriceScraperConfig(BaseModel):
-    concurrent: int = 5  # 동시 처리 개수 (1 이면 순차)
+    concurrent: int = 12  # 동시 처리 개수 (1 이면 순차). HTTP fast path 라 12 까지 안전.
     per_product_timeout_ms: int = 8000
-    inter_request_delay_ms: int = 300
+    inter_request_delay_ms: int = 0
 
 
 class ExcelConfig(BaseModel):

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -109,6 +110,8 @@ class MainWindow(QMainWindow):
         self._busy = False
         # 병렬 진행 중인 단건 주문 행 번호 집합 (UI 스레드에서만 read/write)
         self._busy_rows: set[int] = set()
+        # 행별 실행 중 Future 추적 — stale lock 자동 복구용
+        self._row_futures: dict[int, Future] = {}
         # 엑셀 저장 직렬화용 락 — 동시 save() 가 같은 파일에 쓰는 충돌 방지
         from threading import Lock
         self._excel_save_lock = Lock()
@@ -453,6 +456,16 @@ class MainWindow(QMainWindow):
         self.action_browser = QAction("브라우저 열기", self)
         self.action_browser.triggered.connect(self._on_open_browser)
 
+        # 11번가 로그인 — 로그인이 풀렸을 때 사용자가 즉시 로그인 페이지를
+        # 띄울 수 있는 명시적 진입점. 카톡/T월드 SSO 로그인은 세션 쿠키가
+        # 휘발되는 사례가 잦아 매번 켰을 때 재로그인이 필요할 수 있다.
+        self.action_login_11st = QAction("11번가 로그인", self)
+        self.action_login_11st.setToolTip(
+            "11번가 로그인 페이지를 앱 브라우저에서 엽니다. "
+            "이미 로그인되어 있으면 그대로 유지됩니다."
+        )
+        self.action_login_11st.triggered.connect(self._on_login_11st)
+
         self.action_install_shopback = QAction("샵백 확장프로그램 설치", self)
         self.action_install_shopback.setToolTip(
             "Chrome Web Store 의 샵백 페이지를 앱 브라우저에서 열어줍니다. "
@@ -468,6 +481,7 @@ class MainWindow(QMainWindow):
         # 전체 '주문하기' 버튼은 제거 — 행을 더블클릭해 한 건씩만 진행.
         tb.addAction(self.action_back_home)      # ← 시작 화면 (맨 왼쪽)
         tb.addSeparator()
+        tb.addAction(self.action_login_11st)     # 11번가 로그인 (수동 트리거)
         tb.addAction(self.action_save_original)  # 원본에 저장
         tb.addAction(self.action_scrape)         # 가격 조회
         tb.addAction(self.action_fill)           # 기입 (모든 필드 한 번에)
@@ -751,6 +765,17 @@ class MainWindow(QMainWindow):
         except AppError as exc:
             QMessageBox.critical(self, "저장 실패", str(exc))
 
+    def _save_excel_locked(self, rows) -> None:
+        """엑셀 저장 lock 획득 후 동기 저장. 워커 스레드에서 호출 가능.
+
+        가격 조회 디바운스 라이터에서 사용 — to_thread 로 호출되어
+        qasync 이벤트루프를 막지 않는다.
+        """
+        if not self.excel_mgr:
+            return
+        with self._excel_save_lock:
+            self.excel_mgr.save(rows)
+
     # -------------------------------------------------------------
     # Slots: Browser / Price
     # -------------------------------------------------------------
@@ -760,13 +785,72 @@ class MainWindow(QMainWindow):
             return
         self._run_async(self._open_browser_async())
 
+    def _on_login_11st(self) -> None:
+        """사용자가 직접 11번가 로그인 페이지를 띄우는 진입점.
+
+        카톡/T월드 SSO 로 로그인했을 때 다음 실행에서 세션이 풀리는 경우,
+        이 버튼으로 즉시 깨끗한 로그인 페이지를 열고 다시 로그인할 수 있다.
+        """
+        if not self._try_acquire():
+            self.statusBar().showMessage(
+                "다른 작업 진행 중 — 잠시 후 다시 시도해 주세요", 4000
+            )
+            return
+        self._run_async(self._login_11st_async())
+
+    async def _login_11st_async(self) -> None:
+        try:
+            await self.browser.start()
+            try:
+                await self.browser.show_window()
+            except Exception as exc:
+                log.debug(f"show_window 실패 (계속): {exc}")
+            await self.browser.open_login_page()
+            self._ui(lambda: self.statusBar().showMessage(
+                "Chrome 에서 11번가 로그인을 진행해 주세요"
+            ))
+            log.info("11번가 로그인 페이지 수동 오픈")
+        except AppError as exc:
+            log.error(f"로그인 페이지 열기 실패: {exc}")
+            await self._show_info_async("로그인 페이지 열기 실패", str(exc), icon="critical")
+
     async def _open_browser_async(self) -> None:
         try:
             await self.browser.start()
+            # 카톡/T월드 같은 SSO 로그인은 11번가 자체 세션 쿠키 일부가 휘발성이라
+            # 프로그램 재실행 시 풀리는 경우가 많다. 로그인 상태를 명시적으로
+            # 확인하고, 미로그인이면 곧바로 로그인 페이지를 띄워 사용자가
+            # 별도 메뉴를 찾지 않아도 즉시 로그인할 수 있게 한다.
             self._ui(lambda: self.statusBar().showMessage(
-                "브라우저 준비됨 (11번가 로그인/샵백 설치 후 재사용됩니다)"
+                "11번가 로그인 상태 확인 중..."
             ))
-            log.info("브라우저 연결 완료 - 11번가에 로그인하세요")
+            try:
+                logged_in = await self.browser.is_logged_in(
+                    self.selectors, timeout_sec=10.0
+                )
+            except Exception as exc:
+                log.warning(f"로그인 체크 실패 (미로그인 간주): {exc}")
+                logged_in = False
+
+            if logged_in:
+                self._ui(lambda: self.statusBar().showMessage(
+                    "브라우저 준비됨 — 11번가 로그인 유지됨"
+                ))
+                log.info("브라우저 연결 완료 — 11번가 로그인 유지됨")
+            else:
+                # 사용자가 바로 로그인 진행할 수 있게 창을 보여주고 로그인 페이지 띄움
+                try:
+                    await self.browser.show_window()
+                except Exception as exc:
+                    log.debug(f"show_window 실패 (계속): {exc}")
+                try:
+                    await self.browser.open_login_page()
+                except Exception as exc:
+                    log.warning(f"로그인 페이지 자동 오픈 실패: {exc}")
+                self._ui(lambda: self.statusBar().showMessage(
+                    "Chrome 에서 11번가 로그인을 진행해 주세요"
+                ))
+                log.info("미로그인 — 로그인 페이지 자동 오픈")
         except AppError as exc:
             log.error(f"브라우저 시작 실패: {exc}")
             await self._show_info_async("브라우저 시작 실패", str(exc), icon="critical")
@@ -980,6 +1064,11 @@ class MainWindow(QMainWindow):
 
         if not self._try_acquire():
             return
+        self.statusBar().showMessage("가격 조회 시작 — 잠시만 기다려 주세요...")
+        log.info(
+            f"가격 조회 버튼 클릭 — 대상={'선택' if targets else '전체'} "
+            f"({len(targets) if targets else len(self.model.valid_orders())}건)"
+        )
         self._run_async(
             self._scrape_prices_async(only_missing=False, targets=targets)
         )
@@ -995,15 +1084,42 @@ class MainWindow(QMainWindow):
         targets=None 이면 전체 valid 행. 리스트 주면 그 행들만.
         """
         try:
+            log.info("가격 조회 코루틴 진입 — 브라우저 준비 중")
+            self._ui(lambda: self.statusBar().showMessage(
+                "가격 조회 준비 중 (브라우저 시작)..."
+            ))
             await self.browser.start()
+            log.info("가격 조회: 브라우저 준비 완료 — 스크래퍼 초기화")
             self._scraper = PriceScraper(
                 self.browser, self.selectors, self.settings.price_scraper
             )
 
+            # 디바운스 저장: 콜백마다 전체 워크북을 다시 쓰면 17건일 때
+            # 17번의 풀-쓰기가 발생해 fast path 의 이득을 통째로 깎아먹는다.
+            # 메모리/UI 는 즉시 반영하고, 디스크 저장은 0.4초 간격으로 1회만.
+            dirty_evt = asyncio.Event()
+            stop_evt = asyncio.Event()
+
+            async def _excel_writer() -> None:
+                while not stop_evt.is_set():
+                    try:
+                        await asyncio.wait_for(dirty_evt.wait(), timeout=0.4)
+                    except asyncio.TimeoutError:
+                        continue
+                    dirty_evt.clear()
+                    if not self.excel_mgr:
+                        continue
+                    try:
+                        rows_snapshot = self.model.all_rows()
+                        await asyncio.to_thread(
+                            self._save_excel_locked, rows_snapshot
+                        )
+                    except Exception as exc:
+                        log.warning(f"가격 디바운스 저장 실패: {exc}")
+
             def progress(current: int, total: int, order: Order) -> None:
                 # 백그라운드 스레드에서 호출됨 — UI 변경은 메인 스레드로 마샬링.
-                # 엑셀 저장은 워커 스레드에서 즉시 수행하여 가격 결과가
-                # 들어오는 즉시 디스크에 반영되도록 한다 (sleep/배치 대기 없음).
+                # 디스크 저장은 디바운스 라이터 코루틴이 일괄 처리.
                 cur, tot = current, total
                 ord_ = order
                 self._ui(lambda: (
@@ -1014,20 +1130,42 @@ class MainWindow(QMainWindow):
                 if self.excel_mgr:
                     try:
                         self.excel_mgr.update_order(ord_)
-                        with self._excel_save_lock:
-                            self.excel_mgr.save(self.excel_mgr.rows)
                     except Exception as exc:
-                        log.warning(f"가격 즉시 저장 실패 (행 {ord_.row}): {exc}")
+                        log.warning(f"가격 메모리 갱신 실패 (행 {ord_.row}): {exc}")
+                # 이벤트는 thread-safe 하지 않지만 set 자체는 멱등.
+                # qasync 환경에서 워커 스레드에서 set 해도 다음 wait_for 가 깨움.
+                try:
+                    dirty_evt.set()
+                except Exception:
+                    pass
 
             scrape_list = targets if targets is not None else self.model.valid_orders()
-            await self._scraper.scrape_all(
-                scrape_list, on_progress=progress, only_missing=only_missing
+            log.info(
+                f"가격 조회: 대상 {len(scrape_list)}건 (only_missing={only_missing}) — scrape_all 호출"
             )
-            # 스크랩 결과는 진행 콜백에서 이미 즉시 디스크에 저장됨.
-            # 마지막에 한 번 더 저장해 누락된 행이 없도록 보강.
+            self._ui(lambda: self.statusBar().showMessage(
+                f"가격 조회 시작 — 대상 {len(scrape_list)}건"
+            ))
+            writer_task = asyncio.create_task(_excel_writer())
+            try:
+                await self._scraper.scrape_all(
+                    scrape_list, on_progress=progress, only_missing=only_missing
+                )
+            finally:
+                stop_evt.set()
+                dirty_evt.set()
+                try:
+                    await asyncio.wait_for(writer_task, timeout=2.0)
+                except (asyncio.TimeoutError, Exception):
+                    writer_task.cancel()
+            # 마지막 보강 저장 — 디바운스 라이터가 마지막 변경분을 못 받았을 가능성 차단.
             if self.excel_mgr:
-                with self._excel_save_lock:
-                    self.excel_mgr.save(self.model.all_rows())
+                try:
+                    await asyncio.to_thread(
+                        self._save_excel_locked, self.model.all_rows()
+                    )
+                except Exception as exc:
+                    log.warning(f"가격 최종 저장 실패: {exc}")
             self._ui(lambda: (
                 self.statusBar().showMessage("가격 조회 완료 — 저장 가능합니다"),
                 self._refresh_summary(),
@@ -1037,6 +1175,15 @@ class MainWindow(QMainWindow):
         except AppError as exc:
             log.error(f"가격 조회 실패: {exc}")
             await self._show_info_async("가격 조회 실패", str(exc), icon="critical")
+            return False
+        except Exception as exc:
+            # 어떤 예외든 silent 종료 금지 — 로그 + 사용자 알림.
+            log.exception(f"가격 조회 중 예상치 못한 오류: {exc}")
+            await self._show_info_async(
+                "가격 조회 실패",
+                f"가격 조회 중 오류가 발생했습니다.\n\n{type(exc).__name__}: {exc}",
+                icon="critical",
+            )
             return False
 
     # -------------------------------------------------------------
@@ -1089,10 +1236,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"행 {order.row} 주문 시작 중...", 3000)
         # 단건 주문도 가격 가드 적용. 끝나면 행 lock 해제.
         target_row = order.row
-        self._run_async(
+        fut = self._run_async(
             self._run_single_order_with_guard(order),
             on_done=lambda _f, r=target_row: self._release_row(r),
         )
+        self._row_futures[target_row] = fut
 
     async def _run_single_order_with_guard(self, order: Order) -> None:
         # 토탈가격이 비어있으면 묻지 말고 바로 조회 진행
@@ -1679,10 +1827,11 @@ class MainWindow(QMainWindow):
             # 행별 lock 으로 병렬 진행 허용
             if self._try_acquire_row(order.row):
                 target_row = order.row
-                self._run_async(
+                fut = self._run_async(
                     self._run_single_order_with_guard(order),
                     on_done=lambda _f, r=target_row: self._release_row(r),
                 )
+                self._row_futures[target_row] = fut
         elif action is skip:
             order.status = "completed"
             self.model.update_order(order)
@@ -1969,6 +2118,20 @@ class MainWindow(QMainWindow):
         def _bridge(f: Future) -> None:
             # add_done_callback 은 백그라운드 스레드에서 실행되므로,
             # UI 변경이 있는 콜백은 메인 스레드로 옮겨준다.
+            # future 예외가 silent 로 묻히는 것을 막기 위해 결과를 한 번 검사한다.
+            fut_exc: BaseException | None = None
+            try:
+                if not f.cancelled():
+                    fut_exc = f.exception()
+            except Exception:
+                fut_exc = None
+            if fut_exc is not None:
+                log.error(
+                    f"백그라운드 코루틴 '{coro_name}' 예외: "
+                    f"{type(fut_exc).__name__}: {fut_exc}",
+                    exc_info=(type(fut_exc), fut_exc, fut_exc.__traceback__),
+                )
+
             def _emit():
                 try:
                     if on_done is not None:
@@ -1988,6 +2151,14 @@ class MainWindow(QMainWindow):
                         self._force_abort_armed = False
                         if self._current_future is f:
                             self._current_future = None
+                    if fut_exc is not None:
+                        try:
+                            self.statusBar().showMessage(
+                                f"작업 실패: {type(fut_exc).__name__}: {fut_exc}",
+                                8000,
+                            )
+                        except Exception:
+                            pass
             QTimer.singleShot(0, _emit)
 
         fut.add_done_callback(_bridge)
@@ -1998,18 +2169,33 @@ class MainWindow(QMainWindow):
 
         같은 행을 두 번 누르는 건 막지만, 다른 행은 병렬로 진행 가능.
         품절/취소 등으로 한 행이 멈춰도 다른 행을 시작할 수 있게 한다.
+
+        Stale lock 자동 복구: _busy_rows 에 row 가 있는데 추적 중인 future 가
+        없거나 이미 done 이면, 콜백이 어떤 이유로 호출되지 못한 것으로 간주하고
+        잠금을 해제하여 다시 시작할 수 있게 한다.
         """
         if row in self._busy_rows:
-            self.statusBar().showMessage(
-                f"행 {row} 은(는) 이미 진행 중입니다 (다른 행은 동시 진행 가능)", 3500
-            )
-            return False
+            fut = self._row_futures.get(row)
+            stale = fut is None or fut.done()
+            if stale:
+                log.warning(
+                    f"행 {row}: _busy_rows 에 남아있지만 실행 중 future 없음 → "
+                    "stale lock 자동 해제"
+                )
+                self._busy_rows.discard(row)
+                self._row_futures.pop(row, None)
+            else:
+                self.statusBar().showMessage(
+                    f"행 {row} 은(는) 이미 진행 중입니다 (다른 행은 동시 진행 가능)", 3500
+                )
+                return False
         self._busy_rows.add(row)
         return True
 
     def _release_row(self, row: int) -> None:
         """행 단위 lock 해제. 콜백/finally 에서 호출."""
         self._busy_rows.discard(row)
+        self._row_futures.pop(row, None)
 
     def _try_acquire(self) -> bool:
         """동시 실행 방지. True 면 이번 작업 시작 가능, False 면 거절.
@@ -2430,14 +2616,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         log.info("프로그램 종료 중...")
-        # 백그라운드 러너의 자체 루프에서 브라우저 정리
+        # 백그라운드 러너의 자체 루프에서 브라우저 정리.
+        # timeout 을 넉넉히(15초) 잡아 Chrome 이 쿠키/세션을 디스크로 flush 할
+        # 시간을 보장한다. 짧으면 SSO(카톡/T월드) 로그인 직후 남은 세션 쿠키가
+        # 디스크에 안 써져 다음 실행에서 풀리는 사례가 발생.
         try:
             fut = self._runner.submit(self.browser.close())
-            fut.result(timeout=5)
+            fut.result(timeout=15)
         except Exception as exc:
             log.warning(f"브라우저 종료 오류: {exc}")
         try:
-            self._runner.shutdown(timeout=3)
+            self._runner.shutdown(timeout=5)
         except Exception as exc:
             log.warning(f"러너 종료 오류: {exc}")
 

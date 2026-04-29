@@ -44,7 +44,28 @@ _HTTP_HEADERS = {
 
 # HTML 텍스트에서 가격 직접 추출용 정규식 시퀀스. 우선순위 순서.
 # 11번가 상품 페이지 SSR HTML 에 그대로 들어있는 패턴들.
+#
+# 11번가 PC 상품 SSR 페이지 분석 (price_http_row*.html 덤프 기준):
+#   가격은 상품 메타데이터 형태로 여러 군데 박혀있다. 신뢰도 순서로:
+#   1) <script type="application/ld+json">{..."price":60950,...}  (schema.org, SEO)
+#   2) var prdObj = { ... price: 60950, ... };                     (gtag 트래킹)
+#   3) value: 60950 (gtag conversion 이벤트)
+#   4) <meta property="og:description" content="..., 가격 : 60,950원">
+#   5) <meta name="description" content="..., 할인모음가: 60,950원">
 _PRICE_HTML_PATTERNS = (
+    # 1) JSON-LD schema.org "price":60950 (가장 신뢰도 높음 — SEO 표준)
+    re.compile(r'"price"\s*:\s*(\d{3,9})\b'),
+    # 2) gtag prdObj 안의 price: 60950 (따옴표 없는 JS 객체)
+    re.compile(r'\bprice\s*:\s*(\d{3,9})\b'),
+    # 3) gtag value: 60950 (conversion/page_view 이벤트)
+    re.compile(r'\bvalue\s*:\s*(\d{3,9})\b'),
+    # 4) og:description / twitter:description "가격 : 60,950원"
+    re.compile(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:description|twitter:description|description)["\']'
+        r'[^>]+content=["\'][^"\']*?(?:가격|할인모음가|판매가)\s*[:：]?\s*([\d,]{3,12})\s*원',
+        re.IGNORECASE,
+    ),
+    # --- 이하: 과거 패턴 유지 (11번가 다른 페이지/리뉴얼 대응) ---
     # itemprop="price" content="50000"
     re.compile(r'itemprop=["\']price["\'][^>]*content=["\'](\d{3,9})["\']', re.IGNORECASE),
     re.compile(r'content=["\'](\d{3,9})["\'][^>]*itemprop=["\']price["\']', re.IGNORECASE),
@@ -64,6 +85,9 @@ _PRICE_HTML_PATTERNS = (
 
 class PriceScraper:
     """여러 상품링크를 순차적으로 방문하여 가격 조회."""
+
+    # 한 세션당 1회만 fast path HTML 을 디스크에 덤프 (진단용).
+    _fast_dump_done: bool = False
 
     def __init__(
         self,
@@ -203,42 +227,88 @@ class PriceScraper:
           - 그 외 실패(셀렉터 안 잡힘 등): (None, False)  → 호출자가 Playwright fallback
 
         17건 ≈ 1초. Chrome 시동/탭 생성/렌더링 비용을 통째로 절약.
+
+        진단 로그: fast path 가 왜 실패하는지 보기 위해 단계별 로그를 남긴다.
+        - HTTP 상태/응답 크기/Content-Type
+        - 디코딩 결과 길이
+        - 어느 정규식까지 시도했고 어디서 끊겼는지
+        - 첫 1건은 디스크에 HTML 덤프 (data/diagnostics/price_http_row{N}.html)
         """
         timeout_s = max(2.0, self.config.per_product_timeout_ms / 1000)
+        row_label = order.row
+        url = order.product_url
 
         def _do_request() -> tuple[int | None, bool]:
             req = urllib.request.Request(
-                order.product_url, headers=_HTTP_HEADERS, method="GET"
+                url, headers=_HTTP_HEADERS, method="GET"
             )
             try:
                 with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                     raw = resp.read()
                     enc = resp.headers.get("Content-Encoding", "").lower()
+                    ctype = resp.headers.get("Content-Type", "")
+                    status = resp.status
             except urllib.error.HTTPError as exc:
+                log.info(
+                    f"행{row_label} fast HTTP {exc.code} → fallback "
+                    f"({url[:80]})"
+                )
                 if exc.code == 404:
                     return (None, True)
                 return (None, False)
-            except Exception:
+            except Exception as exc:
+                log.info(
+                    f"행{row_label} fast HTTP 예외: {type(exc).__name__}: {exc} → fallback"
+                )
                 return (None, False)
 
+            log.info(
+                f"행{row_label} fast HTTP {status} bytes={len(raw)} "
+                f"encoding={enc!r} content-type={ctype!r}"
+            )
+
             # gzip/deflate 디코딩
+            decompressed = raw
             try:
                 if enc == "gzip":
-                    raw = gzip.decompress(raw)
+                    decompressed = gzip.decompress(raw)
                 elif enc == "deflate":
-                    raw = zlib.decompress(raw)
-            except Exception:
-                pass
+                    decompressed = zlib.decompress(raw)
+            except Exception as exc:
+                log.info(
+                    f"행{row_label} fast 디코드 실패 (encoding={enc!r}): "
+                    f"{type(exc).__name__}: {exc} → fallback"
+                )
 
             # 한국어 페이지라 utf-8 우선, 실패 시 cp949
             html: str
             try:
-                html = raw.decode("utf-8", errors="replace")
+                html = decompressed.decode("utf-8", errors="replace")
             except Exception:
                 try:
-                    html = raw.decode("cp949", errors="replace")
-                except Exception:
+                    html = decompressed.decode("cp949", errors="replace")
+                except Exception as exc:
+                    log.info(
+                        f"행{row_label} fast 디코딩 완전 실패: {exc} → fallback"
+                    )
                     return (None, False)
+
+            log.debug(f"행{row_label} fast HTML 길이={len(html)}")
+
+            # 첫 1건은 진단용으로 HTML 덤프 — fast path 가 왜 실패하는지 눈으로 확인.
+            try:
+                if not PriceScraper._fast_dump_done:
+                    PriceScraper._fast_dump_done = True
+                    out_dir = Path("data/diagnostics")
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    dump_path = out_dir / f"price_http_row{row_label}.html"
+                    dump_path.write_text(html, encoding="utf-8")
+                    log.info(
+                        f"fast path 진단 HTML 저장: {dump_path} "
+                        f"(가격이 SSR HTML 에 있는지 확인용)"
+                    )
+            except Exception:
+                pass
 
             # 판매중지/페이지 없음 휴리스틱 — 11번가 SSR 에 자주 노출되는 문구
             lowered = html[:20000]
@@ -246,16 +316,29 @@ class PriceScraper:
                     or "삭제된 상품" in lowered
                     or "판매가 종료" in lowered
                     or "판매중지" in lowered):
+                log.info(f"행{row_label} fast 판매중지 키워드 감지")
                 return (None, True)
 
-            # 정규식 시퀀스로 가격 추출
-            for pat in _PRICE_HTML_PATTERNS:
+            # 정규식 시퀀스로 가격 추출 — 어느 패턴에서 잡혔는지 함께 로그
+            for idx, pat in enumerate(_PRICE_HTML_PATTERNS):
                 m = pat.search(html)
                 if not m:
                     continue
-                v = clean_price(m.group(1))
+                raw_val = m.group(1)
+                v = clean_price(raw_val)
                 if v and v > 0:
+                    log.debug(
+                        f"행{row_label} fast 패턴#{idx} 매칭: raw={raw_val!r} → {v}"
+                    )
                     return (v, False)
+                else:
+                    log.debug(
+                        f"행{row_label} fast 패턴#{idx} 매칭됐지만 파싱 실패: raw={raw_val!r}"
+                    )
+            log.info(
+                f"행{row_label} fast 정규식 모두 매칭 실패 (HTML 길이={len(html)}) "
+                f"→ Playwright fallback"
+            )
             return (None, False)
 
         return await asyncio.to_thread(_do_request)

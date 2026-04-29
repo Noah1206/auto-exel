@@ -228,22 +228,30 @@ class OrderAutomation:
             return "user"
 
         async def _wait_pages_closed() -> str:
-            """모든 페이지가 닫힐 때까지 폴링. 닫히면 'closed' 반환."""
+            """이 행이 점유한 페이지가 닫힐 때까지 폴링. 닫히면 'closed' 반환.
+
+            병렬 진행 보호: ctx.pages 전체가 아니라 '이 행 소유의 page' 만 검사.
+            (다른 행이 새 탭을 열어둔 상태에서도 이 행의 페이지 닫힘이 정확히 감지돼야
+             _busy_rows 가 정상적으로 해제됨.)
+            """
             if page is None:
-                await asyncio.Event().wait()
-                return "closed"
-            try:
-                ctx = page.context
-            except Exception:
                 await asyncio.Event().wait()
                 return "closed"
             poll = 0.5
             while True:
                 try:
-                    alive = any(not p.is_closed() for p in ctx.pages)
-                    if not alive:
+                    # 이 행이 더 이상 _pages 에 등록돼 있지 않거나(다른 경로로 정리됨)
+                    # 등록된 페이지가 닫혔으면 종료로 간주.
+                    owned = self._pages.get(row)
+                    if owned is None or owned.is_closed():
                         log.info(
-                            f"행{row}: 모든 페이지 닫힘 감지 → 행 종료"
+                            f"행{row}: 점유 페이지 닫힘 감지 → 행 종료"
+                        )
+                        return "closed"
+                    # 인자로 받은 page 자체가 닫혀도 종료 (방어)
+                    if page.is_closed():
+                        log.info(
+                            f"행{row}: 대기 페이지 닫힘 감지 → 행 종료"
                         )
                         return "closed"
                 except Exception:
