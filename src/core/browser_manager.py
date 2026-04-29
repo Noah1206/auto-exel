@@ -583,6 +583,51 @@ class BrowserManager:
             log.warning(f"로그인 페이지 열기 실패: {exc}")
         # page는 닫지 않음 — 사용자가 그 페이지에서 로그인해야 함
 
+    # 로그인 상태를 갖는 도메인들 — clear_login_state 시 이 도메인 쿠키를 지움.
+    # 11번가 + 카카오 / SKT(T 인증) / 네이버 / 페이스북 / 구글 소셜 로그인 등 포괄.
+    _LOGIN_DOMAINS_TO_CLEAR = (
+        "11st.co.kr", "011st.com",
+        "kakao.com", "kakaocorp.com", "daum.net",
+        "sktelecom.com", "tworld.co.kr", "skt-id.com",
+        "naver.com", "nid.naver.com",
+        "facebook.com", "fb.com",
+        "google.com", "googleapis.com", "accounts.google.com",
+        "payco.com", "nhnpayco.com",
+    )
+
+    async def clear_login_state(self) -> None:
+        """11번가/소셜 로그인 쿠키를 모두 지워 '비로그인' 상태로 초기화.
+
+        Chrome 프로필 자체는 유지(설치된 확장프로그램, 즐겨찾기 등 보존)하되,
+        로그인 토큰만 제거해서 매번 깨끗한 로그인 페이지로 시작하게 한다.
+        프로그램 시작 시 호출하면 사용자가 직접 카카오/T월드 로그인 가능.
+        """
+        ctx = await self.start()
+        try:
+            cookies = await ctx.cookies()
+        except Exception as exc:
+            log.warning(f"쿠키 목록 조회 실패: {exc}")
+            return
+
+        keep: list[dict] = []
+        cleared = 0
+        for c in cookies:
+            domain = (c.get("domain") or "").lstrip(".").lower()
+            if any(d in domain for d in self._LOGIN_DOMAINS_TO_CLEAR):
+                cleared += 1
+                continue
+            keep.append(c)
+
+        try:
+            await ctx.clear_cookies()
+            if keep:
+                await ctx.add_cookies(keep)
+            log.info(
+                f"로그인 쿠키 초기화: {cleared}개 제거, {len(keep)}개 유지"
+            )
+        except Exception as exc:
+            log.warning(f"로그인 쿠키 초기화 실패: {exc}")
+
     # 샵백(Shopback) Chrome Web Store 페이지 — 한국 샵백 캐시백 보상 확장
     SHOPBACK_WEBSTORE_URL = (
         "https://chromewebstore.google.com/detail/"

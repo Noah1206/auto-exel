@@ -127,6 +127,11 @@ class MainWindow(QMainWindow):
         if self.settings.ui.first_run:
             QTimer.singleShot(200, self._show_onboarding_first_time)
 
+        # 시작 시 자동으로 깨끗한 11번가 로그인 페이지를 띄움.
+        # 카톡/T월드 SSO 토큰이 재실행 시 풀리는 경우가 많아 매번 새로 로그인하는 게
+        # 가장 안정적. 사용자가 별도 메뉴를 찾지 않아도 바로 로그인할 수 있다.
+        QTimer.singleShot(500, self._auto_open_fresh_login)
+
     # -------------------------------------------------------------
     # UI setup
     # -------------------------------------------------------------
@@ -813,6 +818,42 @@ class MainWindow(QMainWindow):
         except AppError as exc:
             log.error(f"로그인 페이지 열기 실패: {exc}")
             await self._show_info_async("로그인 페이지 열기 실패", str(exc), icon="critical")
+
+    def _auto_open_fresh_login(self) -> None:
+        """프로그램 시작 직후 자동으로 깨끗한 11번가 로그인 페이지를 띄운다.
+
+        카톡/T월드 SSO 토큰은 재실행 시 풀리는 경우가 많아, 매번 시작 시
+        쿠키를 비우고 로그인 페이지부터 띄워 사용자가 즉시 로그인 가능하게 한다.
+        다른 작업이 진행 중이면 자동 오픈은 건너뛴다.
+        """
+        if not self._try_acquire():
+            log.info("자동 로그인 페이지 오픈 건너뜀 — 다른 작업 진행 중")
+            return
+        self._run_async(self._auto_open_fresh_login_async())
+
+    async def _auto_open_fresh_login_async(self) -> None:
+        try:
+            await self.browser.start()
+            # 이전 세션 로그인 쿠키 정리 — 매번 깨끗한 비로그인 상태로 시작.
+            try:
+                await self.browser.clear_login_state()
+            except Exception as exc:
+                log.warning(f"로그인 상태 초기화 실패 (계속): {exc}")
+            try:
+                await self.browser.show_window()
+            except Exception as exc:
+                log.debug(f"show_window 실패 (계속): {exc}")
+            try:
+                await self.browser.open_login_page()
+            except Exception as exc:
+                log.warning(f"자동 로그인 페이지 오픈 실패: {exc}")
+                return
+            self._ui(lambda: self.statusBar().showMessage(
+                "Chrome 에서 11번가 로그인을 진행해 주세요"
+            ))
+            log.info("시작 시 자동 로그인 페이지 오픈 완료")
+        except Exception as exc:
+            log.warning(f"자동 로그인 페이지 진행 중 오류: {exc}")
 
     async def _open_browser_async(self) -> None:
         try:
