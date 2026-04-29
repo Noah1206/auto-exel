@@ -57,38 +57,21 @@ class BrowserManager:
 
         self._playwright = await async_playwright().start()
 
-        # 창을 화면 밖(왼쪽 -3000px)으로 밀어두어 사용자가 평소에는 못 보게 한다.
-        # 샵백 확장프로그램은 헤드리스 모드에선 로드가 안 되므로 headful 유지가 필수.
-        # 포커스는 어떤 경우에도 Chrome 으로 자동 이동하지 않는다.
-        # 사용자가 UI 버튼으로 '크롬 창 보기'를 누르면 창 위치만 이동(포커스 X).
+        # 창 위치/크기 정책:
+        # 과거에는 hide_window=True 일 때 --window-position=-3000,0 으로 화면 밖으로
+        # 밀고, 필요할 때 osascript/ctypes 로 끌어왔다. 그러나 macOS osascript 는
+        # 'process "Google Chrome" / window 1' 만 매칭해 사용자가 평소 쓰는 Chrome
+        # 창을 건드렸고, Windows ctypes 도 chrome.exe PID 단위 매칭이라 사용자
+        # 평소 Chrome 창까지 같이 리사이즈하는 사이드 이펙트가 있었다.
         #
-        # Windows 한정: --window-position=-3000,0 으로 launch 한 뒤 PowerShell
-        # MoveWindow 로 다시 안으로 못 끌어오는 사례 (멀티모니터/PowerShell 차단/
-        # MainWindowHandle 미할당 등) 가 잦아서, Windows 에서는 hide_window 를
-        # 무시하고 처음부터 화면 안 좌표(0,0) 에 띄운다. 사용자 포커스 보호는
-        # macOS 보다 덜 민감하고, 보이는 게 안 보이는 것보다 낫다.
-        hidden = getattr(self.config, "hide_window", True)
-        if sys.platform == "win32":
-            hidden = False
+        # 우리 Playwright Chrome 만 정확히 식별할 안정적 방법이 없어 창 이동을
+        # 중단하기로 결정. Playwright 가 띄운 창은 OS 기본 위치/사이즈로 그대로
+        # 떠 있고, 사용자가 직접 옮기거나 사이즈 조정한다.
+        # 샵백 확장프로그램은 headful 유지가 필수라 headless 는 사용하지 않는다.
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
         ]
-        if hidden:
-            launch_args += [
-                "--window-position=-3000,0",
-                f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
-            ]
-        elif sys.platform == "win32":
-            # Windows: maximized 만으론 멀티모니터/이전 좌표 기억 등으로
-            # 화면 밖에 뜰 수 있어 (0,0) 좌표 + 사이즈 명시 + maximized 동시 적용.
-            launch_args += [
-                "--window-position=0,0",
-                f"--window-size={self.config.viewport.width},{self.config.viewport.height}",
-                "--start-maximized",
-            ]
-        else:
-            launch_args.append("--start-maximized")
 
         # Windows: 시스템 Chrome 채널 fallback — chrome → chrome-beta → msedge.
         # macOS/Linux 는 첫 시도만.
@@ -220,12 +203,9 @@ class BrowserManager:
         ctx = await self.start()
         page = await ctx.new_page()
         await self._apply_stealth(page)
-        # macOS: 새 탭이 생기면 Chrome 앱이 frontmost 가 되며 사용자 OS 포커스를
-        # 빼앗는다. hide_window 모드라면 즉시 창을 화면 밖으로 다시 밀어내
-        # 사용자가 작업 중이던 앱의 포커스를 보존한다.
-        # Windows 는 hide_window 무시 (창이 화면 안에 그대로 보이는 게 더 중요).
-        if sys.platform != "win32" and getattr(self.config, "hide_window", True):
-            await self.hide_window()
+        # 과거: macOS 에서 새 탭 생성 시 사용자 OS 포커스를 빼앗는 것을 막기 위해
+        # 즉시 창을 화면 밖으로 밀어냈다. 그러나 그 이동 로직이 사용자가 평소 쓰는
+        # Chrome 창까지 같이 건드리는 사이드 이펙트가 있어 이동을 비활성화함.
         return page
 
     async def _apply_stealth(self, page: Page) -> None:
@@ -253,43 +233,23 @@ class BrowserManager:
         return self._context is not None
 
     async def _move_chrome_window(self, x: int, y: int) -> None:
-        """Chrome 창을 (x, y) 로 이동. macOS 는 osascript, Windows 는 ctypes/PowerShell.
+        """Chrome 창 이동 — 비활성화 (no-op).
 
-        포커스를 빼앗지 않도록 activate/frontmost 는 절대 호출하지 않는다.
-        실패해도 silently 무시 — 창 이동은 best-effort.
+        과거: macOS osascript / Windows ctypes(EnumWindows+MoveWindow) 로
+        Chrome 창을 화면 밖/안으로 이동시켜 포커스를 보호하려 했음.
 
-        Windows 는 ctypes(user32.dll) 직접 호출이 1순위. PowerShell 차단 환경
-        (ExecutionPolicy / ConstrainedLanguage / pwsh 만 설치됨) 모두 우회.
-        ctypes 도 실패하면 PowerShell fallback.
+        문제: macOS osascript 의 'process "Google Chrome" / window 1' 매칭과
+              Windows EnumWindows 의 chrome.exe PID 매칭이 모두 사용자가
+              평소 사용 중인 다른 Chrome 창까지 함께 이동·리사이즈하는
+              사이드 이펙트가 있다 (사용자 보고 + 스크린샷 확인).
+
+              우리 Playwright Chrome 만 정확히 식별할 안정적 방법이 없으므로
+              창 이동 자체를 중단. Playwright 이 띄운 창은 OS 기본 위치에
+              그대로 떠 있고, 사용자가 직접 옮길 수 있다.
+
+        호출자 호환성을 위해 메서드는 유지하되 아무 동작도 하지 않는다.
         """
-        import asyncio as _asyncio
-        try:
-            if sys.platform == "darwin":
-                script = (
-                    'tell application "System Events"\n'
-                    '  tell process "Google Chrome"\n'
-                    '    try\n'
-                    f'      set position of window 1 to {{{x}, {y}}}\n'
-                    '    end try\n'
-                    '  end tell\n'
-                    'end tell'
-                )
-                proc = await _asyncio.create_subprocess_exec(
-                    "osascript", "-e", script,
-                    stdout=_asyncio.subprocess.DEVNULL,
-                    stderr=_asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-            elif sys.platform == "win32":
-                if await self._move_chrome_window_ctypes(x, y):
-                    return
-                log.debug("ctypes 창 이동 실패 → PowerShell fallback")
-                await self._move_chrome_window_powershell(x, y)
-            else:
-                # Linux: 창 매니저별로 다르므로 no-op
-                return
-        except Exception as exc:
-            log.debug(f"창 위치 이동 실패: {exc}")
+        return
 
     async def _move_chrome_window_ctypes(self, x: int, y: int) -> bool:
         """ctypes 로 user32.dll 직접 호출 — PowerShell 차단 환경 우회.
