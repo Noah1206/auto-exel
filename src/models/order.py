@@ -144,23 +144,19 @@ class Order(BaseModel):
     def address_search_query(self) -> str:
         """주소찾기 팝업에 입력할 검색어를 반환.
 
-        시/도 (서울특별시, 경기도, 인천광역시 등) 와 구/군 사이의 첫 토큰을 떼고,
-        첫 번지수(예: 271-3, 584-3, 20)까지만 잘라서 반환.
-        아파트명/동/호 같은 상세주소가 섞이면 검색이 실패하므로 떼어낸다.
+        address_base() 에서 시/도만 제거하고 그대로 반환.
+        도로명이면 도로명으로, 지번이면 지번으로 검색.
+        (주소찾기 후 base 는 행정표준으로 자동 갱신됨)
 
         예시:
-          '경기도 김포시 통진읍 마송리 584-3 (통진읍...)' → '김포시 통진읍 마송리 584-3'
-          '서울특별시 강남구 선릉로130길 20 (삼성동)' → '강남구 선릉로130길 20'
-          '노원구 하계동 271-3 극동,건영,벽산아파트 건영아파트 8동 508호'
-            → '노원구 하계동 271-3'
+          base='경기도 고양시 일산동구 식사동 1565' → '고양시 일산동구 식사동 1565'
+          base='서울특별시 강남구 선릉로130길 20' → '강남구 선릉로130길 20'
+          base='경상남도 양산시 어곡공단로 143' → '양산시 어곡공단로 143'
         """
-        text = (self.address or "").strip()
+        text = self.address_base()
         if not text:
             return ""
         import re as _re
-        # 괄호 안 보조 텍스트 제거
-        text = _re.sub(r"\s*\(.*?\)\s*", " ", text).strip()
-        text = _re.sub(r"\s+", " ", text)
         # 시/도 prefix 제거
         SIDO_RE = _re.compile(
             r"^(서울특별시|서울시|서울|"
@@ -181,14 +177,25 @@ class Order(BaseModel):
             r"경상남도|경남|"
             r"제주특별자치도|제주도|제주)\s+"
         )
-        text = SIDO_RE.sub("", text).strip()
-        # 첫 번지수 토큰(숫자[-숫자]) 까지만 남기고 그 뒤(아파트명/동/호)는 제거.
-        # 예) '노원구 하계동 271-3 극동,건영아파트 8동 508호' → '노원구 하계동 271-3'
-        BUNJI_RE = _re.compile(r"^(.*?\d+(?:-\d+)?)\b")
-        m = BUNJI_RE.search(text)
-        if m:
-            text = m.group(1).strip()
-        return text
+        return SIDO_RE.sub("", text).strip()
+
+    def is_jibun_address(self) -> bool:
+        """주소가 지번 형식인지 확인.
+
+        지번: '~동/리/면/읍/가 + 숫자' 패턴 (예: 식사동 1565, 마송리 584-3)
+        도로명: '~로/길/대로 + 숫자' 패턴 (예: 선릉로130길 20, 어곡공단로 143)
+        """
+        import re as _re
+        base = self.address_base()
+        if not base:
+            return False
+        # 도로명 패턴 먼저 체크 (우선)
+        ROAD_RE = _re.compile(r"[가-힣A-Za-z0-9]+(?:대로|로|길)\s*\d")
+        if ROAD_RE.search(base):
+            return False
+        # 지번 패턴 체크
+        JIBUN_RE = _re.compile(r"[가-힣]+(?:동|리|면|읍|가)\s+\d+")
+        return bool(JIBUN_RE.search(base))
 
     def _split_address(self) -> tuple[str, str]:
         """원본 주소를 (도로명+번지, 아파트명+동/호) 두 부분으로 분리.

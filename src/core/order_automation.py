@@ -1484,19 +1484,22 @@ class OrderAutomation:
         # popup_open=False 라도 별도 창/iframe 어딘가에는 있을 수 있어서.
         ok = False
         try:
-            # 검색어는 우편번호 우선 — 5자리 숫자라 도로명·지번 변형에 휘둘리지 않고
-            # 11번가 주소찾기 popup 이 가장 안정적으로 결과를 반환한다.
-            # 우편번호가 비어있을 때만 도로명·지번 텍스트로 fallback.
-            query = order.postal_code or order.address_search_query()
+            # 지번/도로명 판별
+            is_jibun = order.is_jibun_address()
+            # 첫 검색어는 지번이든 도로명이든 address_search_query() 사용 (시/도 뺀 base)
+            query = order.address_search_query()
             log.info(
                 f"행{order.row}: 주소찾기 검색·선택 시작 query={query!r} "
-                f"postal={order.postal_code!r}"
+                f"postal={order.postal_code!r} is_jibun={is_jibun}"
             )
+            # 11번가 해외직구는 도로명 주소 필수 → 지번으로 검색해도 도로명 결과를 선택
+            # (지번 검색 시 도로명 결과에 괄호 안 동 이름이 포함되어 매칭됨)
             ok = await self._auto_search_and_pick_address(
                 page, query,
                 postal=order.postal_code,
                 base_addr=order.address_base(),
                 claimed_popup=claimed_popup,
+                prefer_jibun=False,  # 항상 도로명 결과 선택
             )
             if ok:
                 log.info(
@@ -1751,15 +1754,19 @@ class OrderAutomation:
 
     async def _auto_search_and_pick_address(
         self, page: Page, query: str, postal: str = "", base_addr: str = "",
-        claimed_popup: Page | None = None,
+        claimed_popup: Page | None = None, prefer_jibun: bool = False,
     ) -> bool:
         """팝업에서 query 로 자동 검색 + 결과 자동 선택.
 
-        선택 우선순위:
+        선택 우선순위 (prefer_jibun=False, 도로명 주소):
           1) 우편번호(postal) 일치
           2) base_addr 토큰 매칭이 가장 많은 항목 (60% 이상)
           3) '도로명' 라벨 있는 첫 항목
           4) 첫 결과
+
+        선택 우선순위 (prefer_jibun=True, 지번 주소):
+          1) '지번' 라벨 + base_addr 토큰 매칭
+          2) 지번 번지수 일치 항목
 
         팝업 형태:
           A) inline layer / 같은 페이지 iframe
@@ -1832,7 +1839,7 @@ class OrderAutomation:
 """
 
         pick_js = r"""
-([postal, baseAddr]) => {
+([postal, baseAddr, preferJibun]) => {
   function visible(el) {
     const cs = window.getComputedStyle(el);
     if (cs.display === 'none' || cs.visibility === 'hidden') return false;
@@ -1840,45 +1847,8 @@ class OrderAutomation:
     return r.width > 0 && r.height > 0;
   }
 
-  // 도로명 탭 활성화 — 11번가 popup 의 도로명/지번 탭이 분리된 경우만 안전하게 처리.
-  // 결과 항목(<a onclick="fn_setAddr('road',...)">) 을 탭으로 오인해 클릭하면
-  // popup 이 첫 결과를 자동 선택해 닫혀버려 후속 검색이 부모 페이지로 fall through 한다.
-  // 그래서 '탭으로 보이는 명확한 요소' 만 좁혀서 다룬다.
-  try {
-    // 1) 결과 항목은 절대 건드리면 안 됨 (fn_setAddr / setAddr / selectAddr / chooseAddr)
-    const isResultAnchor = (el) => {
-      if (!el) return false;
-      const onc = (el.getAttribute && el.getAttribute('onclick') || '').toLowerCase();
-      return /fn_setaddr|setaddr|selectaddr|chooseaddr/.test(onc);
-    };
-    // 2) 탭 후보: role=tab 또는 명시적 탭 컨테이너 안의 자식만
-    const tabCandidates = Array.from(document.querySelectorAll(
-      '[role="tab"], '
-      + '.tab a, .tab button, .tab li, '
-      + '.tabs a, .tabs button, .tabs li, '
-      + '.tab_box a, .tab_box button, .tab_box li, '
-      + 'ul.tab > li, ul.tabs > li, '
-      + '[class*="tab" i] > a, [class*="tab" i] > button, [class*="tab" i] > li'
-    ));
-    const roadTabs = tabCandidates.filter(el => {
-      if (!visible(el)) return false;
-      if (isResultAnchor(el)) return false;
-      // 결과 컨테이너 안에 들어있는 요소는 탭이 아니다
-      if (el.closest('#roadList, #jibunList, .search_result_box, #searchResultBox, .result_list_box')) {
-        return false;
-      }
-      const t = (el.innerText || '').replace(/\s+/g, '');
-      // 정확히 "도로명" 또는 "도로명주소" 텍스트만 인정 (결과 행 텍스트 오인 방지)
-      return /^도로명(주소)?$/.test(t);
-    });
-    for (const tab of roadTabs) {
-      try { tab.click(); } catch(e) {}
-    }
-    // 지번 리스트만 명확히 숨김 — 너무 넓은 셀렉터는 도로명까지 같이 죽임.
-    // class/id 가 '지번 결과 리스트' 임이 분명한 것만.
-    document.querySelectorAll('#jibunList, tbody#jibunList, ul#jibunList')
-      .forEach(el => { try { el.style.display = 'none'; } catch(e){} });
-  } catch(e) {}
+  // 탭/리스트 조작 없음 — 결과 선택 시 preferJibun 에 따라 지번/도로명 구분
+  // (11번가 팝업은 탭 없이 결과만 표시하는 경우가 많음)
 
   // 컨테이너: 한 결과 행(도로명+지번+우편번호 묶음).
   // 11번가 popup 의 실제 DOM: <a onclick="$.fn_setAddr('road',...)"> 가
@@ -1977,28 +1947,31 @@ class OrderAutomation:
   function _isJibun(a) { return _classify(a) === 'J'; }
   function _isRoad(a) { return _classify(a) === 'R'; }
 
-  // 정규화: 컨테이너 자체가 a 인 경우, 지번 a 를 같은 결과 행의 도로명 a 로 교체.
+  // preferJibun 에 따라 원하는 타입의 anchor 를 선택
+  const _isPreferred = preferJibun ? _isJibun : _isRoad;
+  const _isOpposite = preferJibun ? _isRoad : _isJibun;
+
+  // 정규화: 컨테이너 자체가 a 인 경우, 반대 타입 a 를 같은 결과 행의 선호 타입 a 로 교체.
   // 11번가 popup 은 보통 <tr> 또는 <li> 안에 도로명 a / 지번 a 두 개를 둔다.
-  // 가장 가까운 TR/LI 조상까지 올라가 그 안의 도로명 a 를 우선 노출.
   containers = containers.map(el => {
     if (!el.matches || !el.matches('a, button')) return el;
-    if (!_isJibun(el)) return el;
+    if (_isPreferred(el)) return el;  // 이미 선호 타입이면 유지
+    if (!_isOpposite(el)) return el;  // 분류 불명이면 유지
     let row = el;
     for (let i = 0; row && i < 6; i++) {
       if (row.tagName === 'TR' || row.tagName === 'LI') break;
       row = row.parentElement;
     }
     const scope = row || el.parentElement || document;
-    const roadCand = Array.from(scope.querySelectorAll('a[onclick], button[onclick]'))
-      .find(a => _isRoad(a) && visible(a));
-    return roadCand || el;  // 도로명 형제 없으면 그대로 두되 후속 매칭 단계서 제외
+    const preferredCand = Array.from(scope.querySelectorAll('a[onclick], button[onclick]'))
+      .find(a => _isPreferred(a) && visible(a));
+    return preferredCand || el;
   });
 
-  // 지번 anchor 만 남은 컨테이너는 매칭 후보에서 제거 (잘못 클릭 방지).
-  // 결과적으로 도로명만 남거나, 도로명/지번 구분 모호한(?) anchor 만 남음.
+  // 반대 타입 anchor 만 남은 컨테이너는 매칭 후보에서 제거.
   containers = containers.filter(el => {
     if (!el.matches || !el.matches('a, button')) return true;  // tr/li 묶음은 통과
-    return !_isJibun(el);
+    return !_isOpposite(el);
   });
 
 
@@ -2059,20 +2032,18 @@ class OrderAutomation:
 
   function pick(container, label) {
     // 컨테이너에서 진짜 클릭해야 할 요소 결정.
-    // 도로명 a / 지번 a 가 별도로 존재 — 도로명을 강력히 우선.
-    // 위에서 정의한 _classify / _isRoad / _isJibun 을 그대로 사용.
-    const isRoadAnchor = _isRoad;
-    const isJibunAnchor = _isJibun;
+    // preferJibun 에 따라 지번/도로명을 우선 선택.
+    // 위에서 정의한 _classify / _isRoad / _isJibun / _isPreferred / _isOpposite 를 사용.
 
     let target = null;
     if (container.matches && container.matches('a, button, [role="button"]')) {
       target = container;
-      // 컨테이너 자체가 지번 a 면, 형제 중 도로명 a 로 교체 시도
-      if (isJibunAnchor(target)) {
+      // 컨테이너 자체가 반대 타입이면, 형제 중 선호 타입으로 교체 시도
+      if (_isOpposite(target)) {
         const parent = container.parentElement;
         if (parent) {
           const cand = Array.from(parent.querySelectorAll('a[onclick], button[onclick]'))
-            .find(isRoadAnchor);
+            .find(_isPreferred);
           if (cand) target = cand;
         }
       }
@@ -2080,15 +2051,16 @@ class OrderAutomation:
       const anchors = Array.from(
         container.querySelectorAll('a[onclick], button[onclick], a, button, [role="button"]')
       );
-      target = anchors.find(isRoadAnchor)
-            || anchors.find(a => !isJibunAnchor(a))
+      // preferJibun 에 따라 선호 타입 우선, 그 다음 반대 아닌 것, 마지막으로 아무거나
+      target = anchors.find(_isPreferred)
+            || anchors.find(a => !_isOpposite(a))
             || anchors[0]
             || container;
     }
     const ok = fire(target);
     if (ok) {
       const t = (container.innerText || '').replace(/\s+/g, ' ').slice(0, 80);
-      const kind = isRoadAnchor(target) ? 'R' : (isJibunAnchor(target) ? 'J' : '?');
+      const kind = _isRoad(target) ? 'R' : (_isJibun(target) ? 'J' : '?');
       const onc = (target && target.getAttribute && target.getAttribute('onclick')) || '';
       const ocSlice = onc.slice(0, 80).replace(/\s+/g, ' ');
       return label + '[' + kind + ']:' + t + ' | oc=' + ocSlice;
@@ -2106,6 +2078,16 @@ class OrderAutomation:
     }
     return el.innerText || '';
   }
+
+  // baseAddr 에서 시/도 prefix 제거 — 토큰 매칭 시 시/도가 포함되면 부정확
+  function _stripSido(b) {
+    if (!b) return '';
+    return b.replace(
+      /^(서울특별시|서울시|서울|부산광역시|부산시|부산|대구광역시|대구시|대구|인천광역시|인천시|인천|광주광역시|광주시|광주|대전광역시|대전시|대전|울산광역시|울산시|울산|세종특별자치시|세종시|세종|경기도|경기|강원특별자치도|강원도|강원|충청북도|충북|충청남도|충남|전북특별자치도|전라북도|전북|전라남도|전남|경상북도|경북|경상남도|경남|제주특별자치도|제주도|제주)\s+/,
+      ''
+    ).trim();
+  }
+  const baseAddrNorm = _stripSido(baseAddr || '');
 
   // baseAddr 에서 도로명 토큰 추출 — '○○로' / '○○길' / '○○대로' / '○○로N번길'
   // 같은 우편번호 안 여러 도로명 중 정답을 가르려면 이 도로명 토큰이 결과 텍스트에
@@ -2125,24 +2107,25 @@ class OrderAutomation:
     const m = b.match(/(?:대로|로|길)\s*(\d+(?:-\d+)?)/);
     return m ? m[1] : '';
   }
-  const baseRoadToken = _extractRoadToken(baseAddr || '');
-  const baseRoadNumber = _extractRoadNumber(baseAddr || '');
+  const baseRoadToken = _extractRoadToken(baseAddrNorm);
+  const baseRoadNumber = _extractRoadNumber(baseAddrNorm);
   const baseHasRoad = !!baseRoadToken;
 
   // 매칭 정책 — "원래 주소와 다른 주소" 가 자동 선택되는 사고 차단:
-  //   case A) base 가 도로명을 포함 (예: '경상남도 양산시 어곡공단로 143')
-  //           → 결과 텍스트에 그 도로명 토큰('어곡공단로')이 반드시 있어야 매칭.
-  //              번지수까지 일치하면 추가 가중치.
-  //   case B) base 가 지번 ('서울특별시 노원구 하계동 271-3')
-  //           → 도로명을 모르므로 도로명 토큰 강제 못 함. 동(洞) 토큰 일치 필수
-  //              + base 토큰 70%+ 일치 + 후보 단일/압도적일 때만 채택.
-  //              모호하면 fail → 호출자가 검색어 시퀀스 다음 단계로 재시도.
+  //   preferJibun=false (도로명 주소):
+  //     case A) base 가 도로명을 포함 (예: '양산시 어곡공단로 143')
+  //             → 결과 텍스트에 그 도로명 토큰('어곡공단로')이 반드시 있어야 매칭.
+  //   preferJibun=true (지번 주소):
+  //     case B) base 가 지번 ('고양시 일산동구 식사동 1565')
+  //             → 지번 결과 중 동/리 + 번지수 일치 항목 선택.
   function _evaluateAnchor(el) {
     const a = (el.matches && el.matches('a, button')) ? el
             : (el.querySelector && el.querySelector('a[onclick], button[onclick]'));
     if (!a) return null;
     const cls = _classify(a);
-    if (cls === 'J') return null;  // 지번은 절대 후보 아님
+    // preferJibun 에 따라 반대 타입은 제외
+    if (preferJibun && cls === 'R') return null;  // 지번 원할 때 도로명 제외
+    if (!preferJibun && cls === 'J') return null;  // 도로명 원할 때 지번 제외
     const aTxt = (a.innerText || '').replace(/\s+/g, ' ');
 
     if (baseHasRoad) {
@@ -2153,7 +2136,7 @@ class OrderAutomation:
           .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*' + baseRoadNumber + '\\b');
         if (numRe.test(aTxt)) bonus = 10;
       }
-      const tokens = (baseAddr || '').split(/\s+/).filter(t => t.length >= 1);
+      const tokens = baseAddrNorm.split(/\s+/).filter(t => t.length >= 1);
       let score = 0;
       for (const tok of tokens) if (aTxt.includes(tok)) score++;
       // anchor 자체 점수가 낮으면 묶음/형제 텍스트로도 추가 점수 (시·도 정보가 부모 행에만 있는 경우)
@@ -2179,18 +2162,12 @@ class OrderAutomation:
       return { el: el, anchor: a, score: score + bonus, total: tokens.length, bonus: bonus, cls: cls };
     }
 
-    // base 가 지번 — 11번가 popup 의 도로명 결과 행은 보통
-    //   '인천광역시 미추홀구 매소홀로 504 (문학동, 법진빌딩)'
-    //   처럼 도로명 + 괄호 안 (동, 건물명) 형태. 즉 도로명 결과 텍스트에
-    //   base 의 '동' 토큰이 포함되면 그 도로명이 정답일 가능성이 매우 높다.
-    //   추가로 지번 번지수까지 텍스트에 들어있으면 거의 확정.
-    if (cls !== 'R') {
-      if (cls !== '?' || !ROAD_RE.test(aTxt)) return null;
-    }
+    // base 가 지번 — preferJibun=true 일 때는 지번 결과(cls='J')를 선택.
+    // 지번 결과가 아니면 도로명 결과에서 동 이름이 포함된 것을 찾는 fallback.
     // base 의 지번 번지(예: '1887-4') 와 동(예: '중산동') 추출
-    const jibunNumMatch = (baseAddr || '').match(/(?:동|리|면|읍|가)\s*(\d+(?:-\d+)?)/);
+    const jibunNumMatch = baseAddrNorm.match(/(?:동|리|면|읍|가)\s*(\d+(?:-\d+)?)/);
     const baseJibunNum = jibunNumMatch ? jibunNumMatch[1] : '';
-    const dongMatch = (baseAddr || '').match(/[가-힣]+(?:동|리|면|읍|가)/);
+    const dongMatch = baseAddrNorm.match(/[가-힣]+(?:동|리|면|읍|가)/);
     const baseDong = dongMatch ? dongMatch[0] : '';
 
     // 결과 묶음 텍스트 — 다음 3계층 모두 합쳐 검사.
@@ -2218,7 +2195,7 @@ class OrderAutomation:
 
     let score = 0;
     let bonus = 0;
-    const tokens = (baseAddr || '').split(/\s+/).filter(t => t.length >= 1);
+    const tokens = baseAddrNorm.split(/\s+/).filter(t => t.length >= 1);
     for (const tok of tokens) if (probeTxt.includes(tok)) score++;
     // ★ 핵심 보너스: 같은 묶음/형제에 base 의 지번 번지(예: '1887-4') 가
     //   그대로 표기되면 거의 정답.
@@ -2342,7 +2319,7 @@ class OrderAutomation:
                 for attempt in range(30):
                     await asyncio.sleep(0.5)
                     try:
-                        r2 = await target.evaluate(pick_js, [postal, base_addr])
+                        r2 = await target.evaluate(pick_js, [postal, base_addr, prefer_jibun])
                     except Exception as exc:
                         log.debug(f"pick_js 실패 (attempt {attempt}): {exc}")
                         continue
@@ -2390,14 +2367,16 @@ class OrderAutomation:
                     break
                 await asyncio.sleep(0.05)
 
-        # 검색어 후보 시퀀스 — 도로명 결과 0건일 때 차례로 시도해 도로명을 끝까지 찾음.
-        # (사용자 직접 처리 없이 100% 자동 완성을 목표)
-        # 1순위: 우편번호 (가장 정확). 도로명 결과 부재 시 동/리 토큰까지 단축한 base.
-        # 2순위: 동까지만 잘라낸 base. 11번가 검색은 동 단위에서 도로명 결과 풍부.
-        # 3순위: 시/구만 남긴 base — 마지막 fallback.
+        # 검색어 후보 시퀀스 — 결과 0건일 때 차례로 시도
+        # 1순위: query (시/도 뺀 base 주소)
+        # 2순위: 우편번호
+        # 3순위: 동까지만 잘라낸 base
+        # 4순위: 시/구만 남긴 base — 마지막 fallback
         query_candidates: list[str] = []
         if query:
             query_candidates.append(query)
+        if postal and postal not in query_candidates:
+            query_candidates.append(postal)
 
         import re as _re
 
@@ -2439,11 +2418,21 @@ class OrderAutomation:
             return outs
 
         if base_addr:
+            # base_addr 에서 시/도 제거한 버전 사용
+            base_no_sido = _re.sub(
+                r"^(서울특별시|서울시|서울|부산광역시|부산시|부산|대구광역시|대구시|대구|"
+                r"인천광역시|인천시|인천|광주광역시|광주시|광주|대전광역시|대전시|대전|"
+                r"울산광역시|울산시|울산|세종특별자치시|세종시|세종|경기도|경기|"
+                r"강원특별자치도|강원도|강원|충청북도|충북|충청남도|충남|"
+                r"전북특별자치도|전라북도|전북|전라남도|전남|경상북도|경북|"
+                r"경상남도|경남|제주특별자치도|제주도|제주)\s+",
+                "", base_addr
+            ).strip()
             # ★ 도로명+번지 검색을 우편번호 다음 우선순위로 (case A 정확도 향상)
-            for s in _road_query(base_addr):
+            for s in _road_query(base_no_sido):
                 if s and s not in query_candidates:
                     query_candidates.append(s)
-            for s in _shorten_base(base_addr):
+            for s in _shorten_base(base_no_sido):
                 if s and s not in query_candidates:
                     query_candidates.append(s)
 
