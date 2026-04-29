@@ -570,8 +570,19 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------
 
     def _on_load_excel(self) -> None:
+        # 시작 디렉토리: 가장 최근에 연 엑셀의 폴더 → 없으면 OS 기본.
+        start_dir = ""
+        recents = list(getattr(self.settings.ui, "recent_excel_files", []) or [])
+        for p in recents:
+            try:
+                parent = Path(p).expanduser().parent
+                if parent.exists():
+                    start_dir = str(parent)
+                    break
+            except Exception:
+                continue
         path, _ = QFileDialog.getOpenFileName(
-            self, "엑셀 파일 선택", "", "Excel Files (*.xlsx *.xls)"
+            self, "엑셀 파일 선택", start_dir, "Excel Files (*.xlsx *.xls)"
         )
         if not path:
             return

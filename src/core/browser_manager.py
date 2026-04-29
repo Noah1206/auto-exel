@@ -121,6 +121,16 @@ class BrowserManager:
         except Exception as exc:
             log.debug(f"context close 핸들러 등록 실패 (무시): {exc}")
 
+        # JS confirm()/alert() 다이얼로그 자동 수락 — 11번가 개인통관부호 삭제 등에서
+        # confirm 다이얼로그가 사용되는데 Playwright 기본은 모두 dismiss 라 사용자가
+        # '확인' 을 누를 수 없게 된다. 모든 페이지에 dialog 핸들러를 자동 등록.
+        try:
+            self._context.on("page", self._attach_dialog_handler)
+            for page in self._context.pages:
+                self._attach_dialog_handler(page)
+        except Exception as exc:
+            log.debug(f"dialog 핸들러 등록 실패 (무시): {exc}")
+
         # stealth 초기화 (선택)
         if self.stealth_enabled:
             try:
@@ -524,6 +534,35 @@ class BrowserManager:
                 await page.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _attach_dialog_handler(page: Page) -> None:
+        """페이지의 JS confirm/alert/prompt 를 자동 accept 한다.
+
+        Playwright 기본 동작은 다이얼로그를 자동 dismiss 라 '삭제하시겠습니까?'
+        같은 confirm 에서 사용자가 '확인' 을 누를 수 없는 상태가 된다.
+        실서비스에서 이 다이얼로그는 거의 항상 사용자가 '확인' 을 누르길
+        기대하므로 자동 accept 로 처리.
+
+        prompt 의 경우 입력값이 필요하지만 11번가 페이지에서는 거의 사용되지
+        않으므로 빈 문자열로 accept.
+        """
+        def _on_dialog(dialog) -> None:
+            try:
+                dtype = getattr(dialog, "type", "")
+                msg = getattr(dialog, "message", "")
+                log.info(f"JS dialog 자동 수락: type={dtype} msg={msg!r}")
+                # accept() 는 coroutine — 동기 핸들러 안에서 await 못 하므로
+                # 내부적으로 task 로 던진다.
+                import asyncio as _aio
+                _aio.create_task(dialog.accept())
+            except Exception as exc:
+                log.debug(f"dialog 처리 실패: {exc}")
+
+        try:
+            page.on("dialog", _on_dialog)
+        except Exception as exc:
+            log.debug(f"dialog 핸들러 부착 실패: {exc}")
 
     async def open_login_page(self) -> None:
         """앱의 Chrome 프로필에서 11번가 로그인 페이지를 열어준다.
