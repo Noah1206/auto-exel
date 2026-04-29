@@ -2120,7 +2120,7 @@ class OrderAutomation:
   //   preferJibun=true (지번 주소):
   //     case B) base 가 지번 ('고양시 일산동구 식사동 1565')
   //             → 지번 결과 중 동/리 + 번지수 일치 항목 선택.
-  function _evaluateAnchor(el) {
+  function _evaluateAnchor(el, postalMatched = false) {
     const a = (el.matches && el.matches('a, button')) ? el
             : (el.querySelector && el.querySelector('a[onclick], button[onclick]'));
     if (!a) return null;
@@ -2193,7 +2193,9 @@ class OrderAutomation:
       }
     } catch(e) {}
 
-    if (baseDong && !probeTxt.includes(baseDong)) return null;
+    // 우편번호가 정확히 일치하면 동 이름 매칭을 완화 (우편번호가 이미 주소를 특정함)
+    // 우편번호 불일치 시에만 동 이름 필수 매칭
+    if (!postalMatched && baseDong && !probeTxt.includes(baseDong)) return null;
 
     let score = 0;
     let bonus = 0;
@@ -2212,13 +2214,15 @@ class OrderAutomation:
     for (const el of containers) {
       const t = fullText(el).replace(/\s+/g, ' ');
       if (!t.includes(postal)) continue;
-      const ev = _evaluateAnchor(el);
+      // 우편번호가 일치하면 postalMatched=true → 동 이름 매칭 완화
+      const ev = _evaluateAnchor(el, true);
       if (ev) candidates.push(ev);
     }
   }
   if (candidates.length === 0) {
     for (const el of containers) {
-      const ev = _evaluateAnchor(el);
+      // 우편번호 불일치 → postalMatched=false → 동 이름 필수 매칭
+      const ev = _evaluateAnchor(el, false);
       if (ev) candidates.push(ev);
     }
   }
